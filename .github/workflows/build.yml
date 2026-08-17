@@ -1,0 +1,98 @@
+name: Build
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install project (with dev extras)
+        run: pip install -e ".[dev]"
+
+      - name: Run tests
+        run: pytest -m "not slow"
+        env:
+          QT_QPA_PLATFORM: offscreen
+
+      - name: Build with PyInstaller
+        run: pyinstaller --clean --noconfirm packaging/powerdc-setup-tool.spec
+
+      - name: Resolve release version
+        id: version
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $v = "0.0.0-dev"
+          } else {
+            $v = "${{ github.ref_name }}" -replace '^v', ''
+          }
+          Write-Host "Resolved version: $v"
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Build installer with Inno Setup
+        shell: pwsh
+        run: |
+          # Same resolve chain as scripts/build.ps1's Resolve-Iscc: windows-latest
+          # ships Inno Setup 6 preinstalled at this fixed path (iscc is NOT
+          # guaranteed to be on PATH there), fall back to PATH, then Chocolatey.
+          function Resolve-Iscc {
+              $fixedPath = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+              if (Test-Path $fixedPath) {
+                  return $fixedPath
+              }
+
+              $isccCmd = Get-Command iscc -ErrorAction SilentlyContinue
+              if ($isccCmd) {
+                  return $isccCmd.Source
+              }
+
+              Write-Host "Inno Setup compiler not found; attempting to install via Chocolatey..."
+              choco install innosetup -y
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Failed to install Inno Setup via Chocolatey (exit code $LASTEXITCODE)."
+              }
+
+              if (Test-Path $fixedPath) {
+                  return $fixedPath
+              }
+
+              throw "Inno Setup compiler (ISCC.exe) was not found, even after attempting a Chocolatey install."
+          }
+
+          $isccPath = Resolve-Iscc
+          & $isccPath "/DMyAppVersion=${{ steps.version.outputs.version }}" packaging\powerdc-setup-tool.iss
+          if ($LASTEXITCODE -ne 0) {
+              throw "Inno Setup failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PowerDC-Setup-Tool-Setup-${{ steps.version.outputs.version }}
+          path: dist/installer/PowerDC-Setup-Tool-Setup-${{ steps.version.outputs.version }}.exe
+
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" `
+            "dist/installer/PowerDC-Setup-Tool-Setup-${{ steps.version.outputs.version }}.exe" `
+            --title "SPD Manipulator for PowerDC ${{ github.ref_name }}" `
+            --notes "Automated release for ${{ github.ref_name }}."

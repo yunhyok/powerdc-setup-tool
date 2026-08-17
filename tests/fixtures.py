@@ -10,9 +10,9 @@ are ``.Connect <RefDes> <PartName> Usage = ... Checked = ...`` / ``.EndC``,
 Pure stdlib, no dependency on ``powerdc_setup_tool`` itself, so this module
 runs standalone (``python3 tests/fixtures.py``) without ``PYTHONPATH=src``.
 
-``expected_dc`` is intentionally a thin NotImplementedError stub (see its
-docstring) -- golden-output rendering is chunk 2's job once
-``core/pdc_gen.py`` and ``core/writer.py`` are real.
+``expected_dc`` (implemented by chunk 2) renders the golden output of
+converting a ``style="si"`` fixture -- with default options it is exactly the
+``style="dc"`` fixture text, since the two miniatures are a converted pair.
 """
 
 from __future__ import annotations
@@ -417,21 +417,57 @@ def build_mini_spd(
     Path(path).write_bytes(content.encode("utf-8"))
 
 
-def expected_dc(*args: object, **kwargs: object) -> str:
+def expected_dc(
+    *,
+    patch_workflow_key: bool = True,
+    other_circuits: bool = True,
+    netlist_body: str | None = None,
+) -> str:
     """Golden DC-converted text for a `style="si"` `build_mini_spd` fixture.
 
-    TODO(chunk 2): implement once `core/pdc_gen.py` and `core/writer.py` are
-    real. Should render the byte-exact expected output of running
-    `writer.write_spd` against a `style="si"` fixture + a resolved config
-    (design §D splice plan / spec §9 pass 2), so `test_writer.py` can assert
-    ``write_spd(...)`` output ``== expected_dc(...)`` (design §E `test_writer`).
-    Signature deliberately left loose (`*args`/`**kwargs`) -- chunk 2 owns
-    deciding exactly what inputs it needs (fixture path/style, a `Session` or
-    `WritePlan`, `newline`, ...).
+    This is the byte-exact expected output of `writer.write_spd` run against a
+    `style="si"` fixture with the canonical config (design §D splice plan / spec
+    §9 pass 2): both power nets get a `.VRM` on `LGA` and a `.Sink` on
+    `SITE{die}`, paired to `DGND`, at their name-derived voltages (0.7 V / 1.2 V,
+    spec §6) and the converter-default 1 A.
+
+    With every argument at its default the result is exactly the `style="dc"`
+    fixture text -- the SI and DC miniatures are a converted pair, so a
+    `write_spd(si) == expected_dc()` assertion is also a cross-check that
+    `core/pdc_gen.py`'s §9 templates agree with the ones spelled out here.
+
+    The keyword arguments mirror the design §C export options, so `test_writer`
+    can assert each toggle: `patch_workflow_key=False` keeps line 1's SI key
+    (design §D step 1), `other_circuits=False` models `plan.other_circuits is
+    None` (no `.OtherCircuit` run), and `netlist_body` replaces the `.NetList`
+    body (design §D step 8; `None` = the writer copied the original bytes).
+
+    Output is always LF-only regardless of the input fixture's `newline`
+    (design §G.6), which is why there is no `newline` argument.
     """
-    raise NotImplementedError(
-        "expected_dc is implemented in chunk 2 (core/pdc_gen.py + core/writer.py)"
-    )
+    text = _render("dc")
+
+    if not patch_workflow_key:
+        dc_title = _title_line("dc")
+        assert text.startswith(dc_title)
+        text = _title_line("si") + text[len(dc_title) :]
+
+    if not other_circuits:
+        text = "".join(
+            line
+            for line in text.splitlines(keepends=True)
+            if not line.startswith(".OtherCircuit ")
+        )
+
+    if netlist_body is not None:
+        body = netlist_body.replace("\r\n", "\n").replace("\r", "\n")
+        if body and not body.endswith("\n"):
+            body += "\n"
+        start = text.index(".NetList\n") + len(".NetList\n")
+        end = text.index(".EndNetList\n", start)
+        text = text[:start] + body + text[end:]
+
+    return text
 
 
 if __name__ == "__main__":
