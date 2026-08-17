@@ -80,6 +80,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="enable verbose rotating file logging instead of WARNING-to-stderr",
     )
+    parser.add_argument(
+        "spd_path",
+        nargs="?",
+        default=None,
+        help="optional .spd file to open and scan on startup",
+    )
     known, _unknown = parser.parse_known_args(argv)
     return known
 
@@ -98,7 +104,8 @@ def main(argv: list[str] | None = None) -> int:
     app = QApplication(sys.argv)
     app.setApplicationName(APP_DISPLAY_NAME)
     app.setOrganizationName("Yunhyok")
-    window = MainWindow()
+    initial_path = Path(args.spd_path) if args.spd_path else None
+    window = MainWindow(initial_path=initial_path)
     window.show()
     return app.exec()
 
