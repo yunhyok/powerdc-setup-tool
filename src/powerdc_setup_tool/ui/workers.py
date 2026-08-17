@@ -22,7 +22,21 @@ __all__ = ["ScanWorker", "ExportWorker"]
 
 
 class ScanWorker(QObject):
-    """Runs `core.spd_scan.scan_spd` off the UI thread."""
+    """Runs `core.spd_scan.scan_spd` off the UI thread.
+
+    *cancel_event* is the exact `ExportWorker` pattern below: a plain
+    `threading.Event`, owned by this worker, polled by `scan_spd` per batch of
+    lines; `cancel()` sets it and the scan unwinds with `ScanCancelled`. Scanning
+    the real 1.4 GB input takes tens of seconds, so without this a window close
+    would either block for that long or destroy a running `QThread` (a fatal Qt
+    error). Created up front, not lazily, so `MainWindow.closeEvent` can set it
+    at any point in the worker's life.
+
+    `ScanCancelled` reaches the UI through `failed`, like every other exception;
+    `MainWindow` distinguishes it from a real failure with its own
+    ``_scan_cancel_requested`` flag rather than by exception type, so a cancel
+    that lands as some other error still does not raise a dialog on shutdown.
+    """
 
     progress = Signal(int, int)
     finished = Signal(object)  # ScanResult
@@ -31,15 +45,22 @@ class ScanWorker(QObject):
     def __init__(self, path: Path, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self.path = Path(path)
+        self.cancel_event = threading.Event()
 
     @Slot()
     def run(self) -> None:
         try:
-            result = scan_spd(self.path, progress=self.progress.emit)
+            result = scan_spd(
+                self.path, progress=self.progress.emit, cancel=self.cancel_event
+            )
         except Exception as exc:  # noqa: BLE001 - surfaced to the UI, not swallowed
             self.failed.emit(str(exc))
             return
         self.finished.emit(result)
+
+    def cancel(self) -> None:
+        """Ask `scan_spd` to stop; it raises `ScanCancelled` at its next poll."""
+        self.cancel_event.set()
 
 
 class ExportWorker(QObject):

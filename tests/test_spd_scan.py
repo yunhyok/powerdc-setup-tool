@@ -10,10 +10,14 @@ tolerated.
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 import fixtures
+from powerdc_setup_tool.core import spd_scan as spd_scan_mod
 from powerdc_setup_tool.core.spd_scan import (
+    ScanCancelled,
     SpdFormatError,
     read_region,
     read_region_text,
@@ -516,3 +520,128 @@ def test_read_region(tmp_path):
         read_region(path, 10, 5)
     with pytest.raises(ValueError):
         read_region(path, -1, 5)
+
+
+# --------------------------------------------------------------------------- #
+# cancellation (design §D's `cancel` hook, scan side)
+# --------------------------------------------------------------------------- #
+
+
+class _CancelAfter:
+    """`threading.Event` stand-in that reports "set" from its *n*-th poll on.
+
+    `scan_spd` only ever calls `is_set()`, so counting the calls is the cheapest
+    way to observe *when* the scan looked -- which is the property under test.
+    """
+
+    def __init__(self, trip_on: int) -> None:
+        self.trip_on = trip_on
+        self.polls = 0
+
+    def is_set(self) -> bool:
+        self.polls += 1
+        return self.polls >= self.trip_on
+
+
+def test_scan_cancel_event_is_optional_and_ignored_when_unset(tmp_path):
+    path = _build(tmp_path)
+    reference = scan_spd(path)
+    scan = scan_spd(path, cancel=threading.Event())
+    assert scan.netlist_body == reference.netlist_body
+    assert scan.powerdc_span == reference.powerdc_span
+    assert scan.pin_maps.by_circuit == reference.pin_maps.by_circuit
+
+
+def test_scan_cancel_set_up_front_raises_before_reading(tmp_path):
+    path = _build(tmp_path)
+    cancel = threading.Event()
+    cancel.set()
+    with pytest.raises(ScanCancelled):
+        scan_spd(path, cancel=cancel)
+
+
+def test_scan_cancel_midway_raises_and_yields_no_result(tmp_path, monkeypatch):
+    """A set event aborts the walk instead of running to EOF.
+
+    The poll granularity is monkeypatched to "every line" (the `test_chunk_boundary`
+    idiom) so a fixture far smaller than one real batch can still exercise the
+    mid-scan path.
+    """
+    path = _build(tmp_path)
+    monkeypatch.setattr(spd_scan_mod, "_CANCEL_POLL_MASK", 0)
+
+    total_lines = path.read_bytes().count(b"\n")
+    cancel = _CancelAfter(trip_on=3)
+    with pytest.raises(ScanCancelled):
+        scan_spd(path, cancel=cancel)
+    # stopped on the third line, nowhere near EOF
+    assert cancel.polls == 3 < total_lines
+
+
+def test_scan_cancel_is_polled_per_line_batch_not_per_line(tmp_path):
+    """design §G.5 budget: the event is checked once per `_CANCEL_POLL_LINES`."""
+    path = _build(tmp_path)
+    total_lines = path.read_bytes().count(b"\n")
+    assert total_lines < spd_scan_mod._CANCEL_POLL_LINES  # one batch, by construction
+
+    cancel = _CancelAfter(trip_on=10**9)  # never trips
+    scan_spd(path, cancel=cancel)
+    # one up-front poll before the file is opened + one for the first (only) batch
+    assert cancel.polls == 2, "a sub-batch file must not poll per line"
+
+
+def test_scan_cancelled_is_not_a_format_error(tmp_path):
+    """`SpdFormatError` is a `ValueError`; a cancel must not be mistaken for one."""
+    assert issubclass(ScanCancelled, RuntimeError)
+    assert not issubclass(ScanCancelled, ValueError)
+
+
+# --------------------------------------------------------------------------- #
+# lossless decoding (design §G.6)
+# --------------------------------------------------------------------------- #
+
+
+def test_netlist_body_round_trips_non_utf8_bytes_exactly(tmp_path):
+    """Regression: `netlist_body` becomes *output* when the classification changes.
+
+    Decoding it with ``errors="replace"`` silently rewrote every undecodable
+    byte to U+FFFD, so an untouched `.NetList` entry came back out mangled.
+    ``surrogateescape`` keeps the original byte recoverable.
+    """
+    path = _build(tmp_path)
+    _rewrite(path, [(b"\tSIG_CLK_IN::", b"\tSIG_CLK\xb5IN::")])
+    data = path.read_bytes()
+    with pytest.raises(UnicodeDecodeError):
+        data.decode("utf-8")
+
+    scan = scan_spd(path)
+    assert "�" not in scan.netlist_body
+    assert "\tSIG_CLK\udcb5IN::" in scan.netlist_body
+    # the whole body re-encodes to exactly the bytes it was read from
+    body_start, body_end = scan.netlist_body_span
+    assert scan.netlist_body.encode("utf-8", "surrogateescape") == data[body_start:body_end]
+    # ... and the parsed entry carries the byte too, not a replacement char
+    assert any(entry.name == "SIG_CLK\udcb5IN" for entry in scan.nets)
+
+
+def test_non_utf8_net_name_agrees_between_pin_index_and_netlist(tmp_path):
+    """Both harvests use the same codec, so the two spellings compare equal.
+
+    With one side on ``replace`` and the other on ``surrogateescape`` a
+    non-UTF-8 net would exist twice under different names and silently show
+    zero pins.
+    """
+    path = _build(tmp_path)
+    # rename the ground net *everywhere* (`.Connect` pin lines and `.NetList`
+    # alike), so the file stays internally consistent -- only its encoding is odd
+    path.write_bytes(path.read_bytes().replace(fixtures.GROUND_NET.encode(), b"DG\xb5ND"))
+    scan = scan_spd(path)
+
+    assert "DG\udcb5ND" in {entry.name for entry in scan.nets}
+    assert scan.pin_maps.pins(fixtures.VRM_COMP, "DG\udcb5ND") == (
+        ("7", "Node1007"),
+        ("8", "Node1008"),
+    )
+    # the *old*, replacement-char spelling must not appear anywhere
+    assert "DG�ND" not in {entry.name for entry in scan.nets}
+    assert not any("DG�ND" in nets for nets in scan.pin_maps.by_circuit.values())

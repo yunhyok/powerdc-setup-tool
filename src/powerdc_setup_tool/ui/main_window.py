@@ -15,6 +15,13 @@ so a second scan started before the first's cleanup lands cannot be wiped out
 from under it. Errors surfaced from a worker use ``QMessageBox.open()``
 (non-blocking), not ``exec()``, since the calling slot runs off a worker
 signal and a nested modal event loop there would freeze the app.
+
+`closeEvent` never lets a running `QThread` be destroyed -- Qt aborts the
+process (``QThread: Destroyed while thread is still running`` -> ``SIGABRT``)
+when that happens. Both workers therefore own a `threading.Event` cancel hook
+(`scan_spd`'s and `write_spd`'s `cancel` parameter); closing sets both, quits
+and waits, and if a thread *still* has not wound down it ignores the close
+event and re-issues it from the thread's own `finished` signal.
 """
 
 from __future__ import annotations
@@ -53,6 +60,10 @@ __all__ = ["MainWindow", "APP_TITLE"]
 
 APP_TITLE = "SPD Manipulator for PowerDC"
 
+#: How long `closeEvent` blocks on each worker thread before giving up on a
+#: synchronous close and retrying from the thread's `finished` signal instead.
+CLOSE_WAIT_MS = 5000
+
 
 class MainWindow(QMainWindow):
     """Top-level window: toolbar, 3-tab `QTabWidget`, status bar, worker lifecycle."""
@@ -68,12 +79,16 @@ class MainWindow(QMainWindow):
         self._pending_spd_path: Path | None = None
         self._busy = False
         self._export_cancel_requested = False
+        self._scan_cancel_requested = False
+        self._closing = False
 
         # Worker/thread refs: kept strong on `self` (see module docstring).
         self._scan_thread: QThread | None = None
         self._scan_worker: ScanWorker | None = None
         self._export_thread: QThread | None = None
         self._export_worker: ExportWorker | None = None
+        # Threads whose `finished` already re-triggers the deferred close.
+        self._close_watched: list[QThread] = []
 
         self.undo_stack = QUndoStack(self)
 
@@ -219,22 +234,70 @@ class MainWindow(QMainWindow):
             self._export_thread = None
             self._export_worker = None
 
-    def closeEvent(self, event: QCloseEvent) -> None:
-        """Quit + wait(5000ms) any running worker threads before accepting."""
-        if self._export_worker is not None:
+    def _cancel_running_workers(self) -> None:
+        """Set both workers' cancel events, so a long run unwinds promptly.
+
+        A scan of the real 1.4 GB input takes tens of seconds; without a cancel
+        hook the `wait()` below would expire with the thread still inside
+        `scan_spd`. The `*_cancel_requested` flags mark the resulting `failed`
+        signal as "the user asked for this", which suppresses the error dialog.
+        """
+        for worker, flag in (
+            (self._scan_worker, "_scan_cancel_requested"),
+            (self._export_worker, "_export_cancel_requested"),
+        ):
+            if worker is None:
+                continue
+            setattr(self, flag, True)
             try:
-                self._export_worker.cancel()
+                worker.cancel()
             except RuntimeError:
                 # The worker's C++ side can already be torn down here: it is
                 # deleted (via deleteLater, on thread-finish) as soon as the
                 # worker thread's `finished` fires, which can race ahead of
-                # the queued slot that clears `self._export_worker` to None.
+                # the queued slot that clears the ref to None.
                 pass
-        for thread in (self._scan_thread, self._export_thread):
-            if thread is not None and thread.isRunning():
-                thread.quit()
-                thread.wait(5000)
+
+    def _running_worker_threads(self) -> list[QThread]:
+        return [
+            thread
+            for thread in (self._scan_thread, self._export_thread)
+            if thread is not None and thread.isRunning()
+        ]
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        """Cancel + quit + wait any running worker thread before accepting.
+
+        Destroying a `QThread` that is still running is a fatal Qt error, so the
+        close is *never* allowed through while one is alive: if the wait expires
+        the event is ignored and re-issued from the thread's own `finished`
+        signal (see the module docstring), leaving the window up but on its way
+        out rather than aborting the process.
+        """
+        self._closing = True
+        self._cancel_running_workers()
+        for thread in self._running_worker_threads():
+            thread.quit()
+            thread.wait(CLOSE_WAIT_MS)
+
+        pending = self._running_worker_threads()
+        if pending:
+            self.status_label.setText("Finishing background work before closing…")
+            for thread in pending:
+                if thread not in self._close_watched:
+                    self._close_watched.append(thread)
+                    thread.finished.connect(self._retry_close)
+            event.ignore()
+            return
+
+        self._close_watched.clear()
         super().closeEvent(event)
+
+    def _retry_close(self) -> None:
+        """Re-issue the deferred close once the last worker thread has wound down."""
+        if not self._closing or self._running_worker_threads():
+            return
+        self.close()
 
     # ------------------------------------------------------------------ #
     # Scan flow (Open SPD / Rescan)
@@ -261,6 +324,7 @@ class MainWindow(QMainWindow):
     def _load_spd(self, path: Path) -> None:
         if self._busy:
             return
+        self._scan_cancel_requested = False
         self._pending_spd_path = Path(path)
         self.status_label.setText(f"Scanning {self._pending_spd_path.name}…")
         self.progress_bar.setRange(0, 0)  # indeterminate until the first callback
@@ -293,6 +357,10 @@ class MainWindow(QMainWindow):
         self._pending_spd_path = None
         self.session.load(result)
         self.session.autopair()
+        # The stack's commands hold row/column keys into the *previous* session;
+        # redoing one after a fresh scan would write a stale edit onto a net
+        # that may not even exist any more (design §C: one shared stack).
+        self.undo_stack.clear()
         self._refresh_all_models()
         self.progress_bar.setVisible(False)
         self._set_busy(False)
@@ -306,6 +374,13 @@ class MainWindow(QMainWindow):
         self._pending_spd_path = None
         self.progress_bar.setVisible(False)
         self._set_busy(False)
+        cancelled = self._scan_cancel_requested
+        self._scan_cancel_requested = False
+        if cancelled:
+            # `ScanCancelled` arrives on the failure path, but the user asked
+            # for it (window close) -- no error dialog, mirroring the export.
+            self.status_label.setText("Scan cancelled.")
+            return
         self.status_label.setText("Scan failed.")
         self._show_error("Open SPD", message)
 
@@ -529,6 +604,10 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError) as exc:
             self._show_error("Load Config", f"Could not load {path}: {exc}")
             return
+        # `apply_json` replaced the config wholesale; the undo stack's commands
+        # still describe edits against the config it replaced (see
+        # `_on_scan_finished`).
+        self.undo_stack.clear()
         self._refresh_all_models()
         self._update_status_counts()
         self.status_label.setText(f"Loaded config from {Path(path).name}")

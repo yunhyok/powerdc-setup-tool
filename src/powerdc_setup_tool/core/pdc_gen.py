@@ -42,7 +42,10 @@ def _num(value: float) -> str:
 
 
 def _blen(text: str) -> int:
-    return len(text.encode("utf-8"))
+    # `surrogateescape` mirrors how `core/writer.py` actually encodes this text:
+    # net/pin names harvested from a non-UTF-8 file carry lone surrogates, which
+    # a plain `encode("utf-8")` would reject outright (design §G.6).
+    return len(text.encode("utf-8", errors="surrogateescape"))
 
 
 def _render_maps(comp: str, net: str, pins: Pins, voltage_inf: bool) -> str:

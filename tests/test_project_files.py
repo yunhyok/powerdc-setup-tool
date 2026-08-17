@@ -64,6 +64,12 @@ def test_spec_defines_entry_path_and_app_name() -> None:
     assert "console=False" in spec
     assert "upx=True" in spec
     assert "COLLECT(" in spec
+    # `pathex` must be anchored to the spec's own directory: relative entries are
+    # resolved against the invocation CWD, and both `scripts/build.ps1` and the
+    # CI workflow run `pyinstaller packaging/...spec` from the repo root, where
+    # ".."/"../src" point outside the checkout entirely.
+    assert "SPECPATH" in spec
+    assert 'pathex=["..", "../src"]' not in spec
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +92,11 @@ def test_iss_defines_app_metadata_and_fresh_appid() -> None:
     assert "Compression=lzma" in iss
     assert "SolidCompression=yes" in iss
     assert "WizardStyle=modern" in iss
-    assert "x64compatible" in iss
+    # `x64compatible` supersedes `x64` only from Inno Setup 6.3 on, and is a hard
+    # compile error on anything older (CI installs whatever choco pins), so the
+    # plain `x64` spelling -- valid across all of 6.x -- is what must be here.
+    assert "ArchitecturesInstallIn64BitMode=x64\n" in iss
+    assert "x64compatible" not in iss
     assert "[Run]" in iss
 
 

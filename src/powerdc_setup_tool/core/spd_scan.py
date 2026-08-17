@@ -8,9 +8,20 @@ ADDENDUM), the netlist body text, and any existing VRM/Sink block headers
 Memory discipline (design §G.5): the file is opened with a 1 MB buffer and
 walked line by line; nothing but the ~300 KB netlist body, the pin index and a
 handful of offsets is retained. Every line is first screened by a *bytes*
-prefix test; only lines that can possibly matter are decoded, and decoding is
-always ``errors="replace"`` (design §G.6 -- decoded text is used for matching
-only, never for output).
+prefix test; only lines that can possibly matter are decoded.
+
+Decoding is always ``errors="surrogateescape"``, **not** ``errors="replace"``:
+`netlist_body` is the one decoded string that can become output (the writer
+emits it whenever the classification changed, design §D step 8), and
+``"replace"`` is lossy -- a stray ``\\xb5`` in a net name would be written back
+out as ``U+FFFD``, mangling a line the user never touched. ``surrogateescape``
+maps every undecodable byte to a lone surrogate that
+``encode("utf-8", errors="surrogateescape")`` turns back into the original
+byte, so untouched entries round-trip byte-exactly (`core/writer.py` encodes
+all generated text the same way). The same codec is used for the `.Connect`
+pin harvest so a non-UTF-8 net name is spelled identically in the pin index and
+in the netlist -- with two different error handlers the two would not compare
+equal and the net would silently show zero pins.
 
 Resolved ambiguities (see module tests for the pinned behaviour):
 
@@ -39,6 +50,7 @@ Resolved ambiguities (see module tests for the pinned behaviour):
 from __future__ import annotations
 
 import re
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -52,7 +64,13 @@ from powerdc_setup_tool.core.model import (
 )
 from powerdc_setup_tool.core.netlist import parse_netlist
 
-__all__ = ["SpdFormatError", "scan_spd", "read_region", "read_region_text"]
+__all__ = [
+    "ScanCancelled",
+    "SpdFormatError",
+    "scan_spd",
+    "read_region",
+    "read_region_text",
+]
 
 # --------------------------------------------------------------------------- #
 # Tunables
@@ -69,6 +87,14 @@ _CANDIDATE_FIRST_BYTES = b".*\t"
 #: Progress throttling (design §G.5: "<= 20 Hz").
 _PROGRESS_MIN_INTERVAL_S = 0.05
 _PROGRESS_MIN_BYTES = 1 << 22
+
+#: Cancel polling granularity, in lines. A 1.4 GB file is ~25 M lines, so the
+#: `threading.Event` is consulted a few thousand times across a full scan:
+#: often enough to abort within milliseconds of the user asking, seldom enough
+#: that `Event.is_set()` stays invisible in the design §G.5 scan budget.
+#: Must stay a power of two -- the poll uses a bitmask, not a modulo.
+_CANCEL_POLL_LINES = 4096
+_CANCEL_POLL_MASK = _CANCEL_POLL_LINES - 1
 
 # --------------------------------------------------------------------------- #
 # Patterns
@@ -112,14 +138,28 @@ class SpdFormatError(ValueError):
     """
 
 
+class ScanCancelled(RuntimeError):
+    """Raised by `scan_spd` when its `cancel` event fires; no `ScanResult` is produced.
+
+    The scan-side twin of `writer.WriteCancelled` (same base class, same
+    "the caller asked, this is not an error" contract): `ui.workers.ScanWorker`
+    reports it through `failed`, and `ui.main_window` suppresses the error
+    dialog for it, exactly as it already does for a cancelled export.
+    """
+
+
 # --------------------------------------------------------------------------- #
 # Small helpers
 # --------------------------------------------------------------------------- #
 
 
 def _decode(raw: bytes) -> str:
-    """Decode one raw line for *matching only* (design §G.6)."""
-    return raw.decode("utf-8", errors="replace")
+    """Decode one raw line losslessly (design §G.6; see the module docstring).
+
+    ``surrogateescape`` keeps undecodable bytes recoverable, so the decoded
+    `netlist_body` can be re-emitted byte-exactly by the writer.
+    """
+    return raw.decode("utf-8", errors="surrogateescape")
 
 
 def _strip_eol(text: str) -> str:
@@ -214,11 +254,22 @@ class _BlockState:
 # --------------------------------------------------------------------------- #
 
 
-def scan_spd(path: Path, progress: Callable[[int, int], None] | None = None) -> ScanResult:
+def scan_spd(
+    path: Path,
+    progress: Callable[[int, int], None] | None = None,
+    cancel: threading.Event | None = None,
+) -> ScanResult:
     """Sequential single pass over *path*; never loads the whole file into memory.
 
     *progress*, if given, is called with ``(bytes_read, file_size)`` throttled
     to <=20 Hz (design §G.5); it always fires once at 0 and once at EOF.
+
+    *cancel*, if given, is a `threading.Event` polled every
+    `_CANCEL_POLL_LINES` lines (and once before the file is opened); when it is
+    set the scan raises :class:`ScanCancelled` instead of finishing. This is the
+    scan-side twin of `writer.write_spd`'s `cancel` hook -- a scan of the real
+    1.4 GB input takes tens of seconds, which is far too long for a window close
+    to block on, and a `QThread` torn down mid-run aborts the process.
 
     Raises :class:`SpdFormatError` when a section the writer must splice into is
     absent (``.PowerDC``/``.EndPowerDC``, the ``* PdcElem`` anchor, the
@@ -226,6 +277,8 @@ def scan_spd(path: Path, progress: Callable[[int, int], None] | None = None) -> 
     land in :attr:`ScanResult.warnings`.
     """
     path = Path(path)
+    if cancel is not None and cancel.is_set():
+        raise ScanCancelled(f"Scan of {path.name} cancelled before it started.")
     started = time.monotonic()
     file_size = path.stat().st_size
 
@@ -294,6 +347,11 @@ def scan_spd(path: Path, progress: Callable[[int, int], None] | None = None) -> 
         for lineno, raw in enumerate(handle):
             start = offset
             offset += len(raw)
+
+            # Cheap cancel poll: one bitmask test per line, an `Event.is_set()`
+            # only once per batch (see `_CANCEL_POLL_LINES`).
+            if cancel is not None and (lineno & _CANCEL_POLL_MASK) == 0 and cancel.is_set():
+                raise ScanCancelled(f"Scan of {path.name} cancelled.")
 
             if progress is not None and offset >= next_progress_at:
                 now = time.monotonic()
@@ -571,5 +629,9 @@ def read_region(path: Path, start: int, end: int) -> bytes:
 
 
 def read_region_text(path: Path, start: int, end: int) -> str:
-    """:func:`read_region` decoded as UTF-8 with ``errors="replace"`` (design §G.6)."""
-    return read_region(path, start, end).decode("utf-8", errors="replace")
+    """:func:`read_region` decoded as UTF-8 with ``errors="surrogateescape"``.
+
+    Same codec as :func:`_decode` (design §G.6), so a region read back here
+    compares equal to the same bytes seen during the scan.
+    """
+    return read_region(path, start, end).decode("utf-8", errors="surrogateescape")

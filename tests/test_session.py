@@ -32,6 +32,7 @@ from fixtures import (
 from powerdc_setup_tool.core.model import CircuitInfo, PinMapIndex, ScanResult
 from powerdc_setup_tool.core.netlist import parse_netlist, render_netlist
 from powerdc_setup_tool.core.session import (
+    CLASS_POWER,
     Session,
     net_key,
     sink_key,
@@ -791,7 +792,35 @@ def test_build_plan_other_circuits_none_vs_tuple(tmp_path: Path) -> None:
     # "leave the input's own run alone" (writer.WritePlan docstring)
     assert session.build_plan({}).other_circuits == ("C1_0", "C1_1")
     assert session.build_plan({"other_circuits": True}).other_circuits == ("C1_0", "C1_1")
-    assert session.build_plan({"other_circuits": False}).other_circuits is None
+    # Regression: the export dialog's checkbox is two-state, so OFF must mean
+    # *strip* -- an empty tuple -- not None. None passes the input's own run
+    # straight through, which for an already-DC input is the whole 10 592-line
+    # run the user just asked not to emit.
+    assert session.build_plan({"other_circuits": False}).other_circuits == ()
+    # None stays reachable, but only for a caller that explicitly asks for it.
+    assert session.build_plan({"other_circuits": None}).other_circuits is None
+
+
+def test_build_plan_other_circuits_off_strips_an_already_dc_input(tmp_path: Path) -> None:
+    """Regression: "Emit .OtherCircuit blocks" OFF removes the input's own run.
+
+    The end-to-end proof of the ``()``-not-``None`` semantics above: a `dc`
+    fixture *does* carry `.OtherCircuit` lines, so this is the case where
+    leave-alone and strip produce different bytes.
+    """
+    scan = _scan(tmp_path, "dc", name="dc_in.spd")
+    session = Session()
+    session.load(scan)
+
+    stripped = tmp_path / "stripped.spd"
+    write_spd(scan, session.build_plan({"other_circuits": False}), stripped)
+    assert b".OtherCircuit" not in stripped.read_bytes()
+    assert stripped.read_bytes() == expected_dc(other_circuits=False).encode("utf-8")
+
+    # ... while an explicit None still passes the input's run through untouched.
+    left_alone = tmp_path / "left_alone.spd"
+    write_spd(scan, session.build_plan({"other_circuits": None}), left_alone)
+    assert b".OtherCircuit" in left_alone.read_bytes()
 
 
 def test_build_plan_filters_other_circuits_by_the_shared_pattern() -> None:
@@ -909,3 +938,44 @@ def test_end_to_end_with_an_edited_voltage(tmp_path: Path) -> None:
     # the untouched net keeps its guessed voltage
     assert f".VRM NominalVoltage = 1.2 SenseVoltage = 1.2 OutputCurrent = 1 " in text
     assert b"\r" not in out.read_bytes()
+
+
+def test_end_to_end_non_utf8_net_survives_another_nets_classification_change(
+    tmp_path: Path,
+) -> None:
+    """Regression: rewriting the `.NetList` must not mangle untouched entries.
+
+    `SIG_CLK_IN` appears exactly once in the fixture -- in the `.NetList`, with
+    no `.Connect` pins -- so a raw ``\\xb5`` planted in its name is carried by
+    nothing but `ScanResult.netlist_body`. Classifying a *different* net
+    (`SIG_RESET_N`) forces the whole body to be re-rendered and re-emitted, and
+    with the old ``errors="replace"`` decode the byte came back out as the three
+    UTF-8 bytes of U+FFFD -- a silent corruption of a line the user never
+    touched (design §G.6 "copy untouched regions byte-for-byte").
+    """
+    source = tmp_path / "in.spd"
+    build_mini_spd(source, style="si")
+    source.write_bytes(source.read_bytes().replace(b"\tSIG_CLK_IN::", b"\tSIG_CLK\xb5IN::", 1))
+    with pytest.raises(UnicodeDecodeError):
+        source.read_bytes().decode("utf-8")
+
+    scan = scan_spd(source)
+    session = Session()
+    session.load(scan)
+    session.autopair()
+    assert session.build_plan({}).netlist_body is None, "baseline must be a byte copy"
+
+    session.set_class("SIG_RESET_N", CLASS_POWER)
+    plan = session.build_plan({})
+    assert plan.netlist_body is not None, "a classification change must rewrite the body"
+
+    out = tmp_path / "out.spd"
+    write_spd(scan, plan, out)
+    written = out.read_bytes()
+
+    # the untouched entry is byte-identical, `\xb5` and all
+    assert b"\tSIG_CLK\xb5IN::Unselected||DropShape Color = GREEN\n" in written
+    assert "�".encode("utf-8") not in written
+    # ... while the net that *was* reclassified did move
+    assert b"\tSIG_RESET_N Color = YELLOW\n" in written
+    assert b"\tSIG_RESET_N::Unselected" not in written

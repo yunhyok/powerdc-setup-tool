@@ -1343,13 +1343,31 @@ class Session:
     # Export (design §D)
     # ------------------------------------------------------------------ #
 
-    def build_plan(self, opts: Mapping[str, bool] | None = None) -> WritePlan:
+    def build_plan(self, opts: Mapping[str, bool | None] | None = None) -> WritePlan:
         """Freeze the current config into a `WritePlan` for `writer.write_spd` (§D).
 
         *opts* mirrors the design §C export-dialog checkboxes, all default ON:
         ``"other_circuits"``, ``"patch_workflow_key"``, ``"rewrite_netlist"``
         (plus ``"emit_power_voltage"``, default OFF -- spec §2 says power members
         carry no ``Voltage =``).
+
+        ``"other_circuits"`` is tri-state, because `WritePlan.other_circuits` is:
+
+        * ``True`` -- "Emit .OtherCircuit blocks" **ticked**: emit the scanned
+          names, i.e. `WritePlan.other_circuits` is a populated tuple, and the
+          writer regenerates the run.
+        * ``False`` -- the checkbox **unticked**: `()`, i.e. the writer still
+          regenerates the run, but from nothing -- it **strips** the blocks.
+        * ``None`` -- *no* UI state maps here: `None`, i.e. the writer leaves
+          whatever the input carries alone.
+
+        The checkbox is a two-state `QCheckBox`, so the UI only ever produces the
+        first two. Unticking it must *remove* the blocks from the output, not
+        silently pass through whatever the input happened to carry -- which, for
+        an already-DC input, is a full 10 592-line run, the opposite of what the
+        user asked for. ``None`` stays reachable for a caller that genuinely
+        wants the leave-alone behaviour (`test_writer`'s DC-in/DC-out
+        passthrough case builds its `WritePlan` that way).
 
         The configs are copied, so an export running on a worker thread cannot be
         mutated mid-write by the UI.
@@ -1382,11 +1400,18 @@ class Session:
             if rendered != scan.netlist_body:
                 netlist_body = rendered
 
-        other_circuits: tuple[str, ...] | None = None
-        if options.get("other_circuits", True):
+        # Tri-state (see the docstring table): only an *explicit* None means
+        # "leave alone"; a False checkbox means "strip", i.e. an empty tuple.
+        emit_other = options.get("other_circuits", True)
+        other_circuits: tuple[str, ...] | None
+        if emit_other is None:
+            other_circuits = None
+        elif emit_other:
             other_circuits = tuple(
                 name for name in scan.other_circuit_names if OTHER_CIRCUIT_RE.match(name)
             )
+        else:
+            other_circuits = ()
 
         return WritePlan(
             vrms=vrms,

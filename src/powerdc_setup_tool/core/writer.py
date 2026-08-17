@@ -154,7 +154,7 @@ class _Cursor:
         self.flush_pending_cr()
         if not text:
             return
-        data = text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
+        data = _encode(text.replace("\r\n", "\n").replace("\r", "\n"))
         self.dst.write(data)
         self.reporter.add(len(data))
 
@@ -357,6 +357,20 @@ def _normalize_text(text: str) -> str:
     return normalized + "\n"
 
 
+def _encode(text: str) -> bytes:
+    """UTF-8 encode generated text, mirroring `spd_scan`'s ``surrogateescape`` decode.
+
+    `plan.netlist_body` is a re-rendered copy of `ScanResult.netlist_body`, which
+    `core/spd_scan.py` decodes with ``errors="surrogateescape"`` so that bytes
+    the file's own encoding cannot explain survive as lone surrogates. Encoding
+    with the same handler turns them back into the original bytes, which is what
+    makes a `.NetList` line the user never touched come out byte-identical even
+    though a *different* net's classification forced the whole body to be
+    rewritten (design §G.6 "copy untouched regions byte-for-byte").
+    """
+    return text.encode("utf-8", errors="surrogateescape")
+
+
 def _ensure_output_is_not_source(source: Path, output: Path) -> None:
     """Raise `ValueError` if *output* resolves to the same file as *source*."""
     if source.exists() and output.exists() and os.path.samefile(source, output):
@@ -408,10 +422,10 @@ def _plan_size_delta(scan: ScanResult, plan: WritePlan) -> int:
         delta -= end - start
     if plan.netlist_body is not None:
         body_start, body_end = scan.netlist_body_span
-        delta += len(_normalize_text(plan.netlist_body).encode("utf-8")) - (body_end - body_start)
+        delta += len(_encode(_normalize_text(plan.netlist_body))) - (body_end - body_start)
     if plan.patch_workflow_key and scan.workflow_key_span is not None:
         key_start, key_end = scan.workflow_key_span
-        delta += len(WORKFLOW_KEY_DC.encode("utf-8")) - (key_end - key_start)
+        delta += len(_encode(WORKFLOW_KEY_DC)) - (key_end - key_start)
     return delta
 
 

@@ -25,6 +25,7 @@ import os
 # design §E: the offscreen platform must be selected before PySide6 is imported.
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import threading  # noqa: E402
 import time  # noqa: E402
 from collections.abc import Callable, Iterator  # noqa: E402
 from pathlib import Path  # noqa: E402
@@ -41,7 +42,9 @@ from fixtures import (  # noqa: E402
     expected_dc,
 )
 from powerdc_setup_tool.core.session import Session  # noqa: E402
-from powerdc_setup_tool.core.spd_scan import scan_spd  # noqa: E402
+from powerdc_setup_tool.core.spd_scan import ScanCancelled, scan_spd  # noqa: E402
+from powerdc_setup_tool.ui import main_window as main_window_mod  # noqa: E402
+from powerdc_setup_tool.ui import workers as workers_mod  # noqa: E402
 from powerdc_setup_tool.ui.main_window import APP_TITLE, MainWindow, _ExportOptionsDialog  # noqa: E402
 from powerdc_setup_tool.ui.models import NetTableModel, SinkTableModel, VrmTableModel  # noqa: E402
 from powerdc_setup_tool.ui.net_manager import NetManagerTab  # noqa: E402
@@ -594,3 +597,186 @@ def test_net_manager_auto_classify_toolbar_action(
 
     assert window.session.nets[POWER_NET_A].paired_gnd == GROUND_NET
     assert "Auto-classification" in window.status_label.text()
+
+
+# --------------------------------------------------------------------------- #
+# closing mid-scan (regression: SIGABRT from a QThread destroyed while running)
+# --------------------------------------------------------------------------- #
+
+
+def _blocking_scan(release: threading.Event, entered: threading.Event, *, honour_cancel: bool):
+    """A `scan_spd` stand-in that stays inside the worker thread until released.
+
+    The mini fixture scans in microseconds, so a *real* mid-scan close is
+    unraceable; this stands in for the 1.4 GB file, where the scan genuinely
+    runs for tens of seconds after the user hits the X.
+    """
+
+    def _scan(path, progress=None, cancel=None):
+        assert cancel is not None, "ScanWorker must pass its cancel event to scan_spd"
+        entered.set()
+        if honour_cancel:
+            # the real `scan_spd` polls this per line batch and raises
+            if not cancel.wait(15.0):
+                raise AssertionError("closeEvent never set the scan's cancel event")
+        else:
+            release.wait(15.0)
+        raise ScanCancelled(f"Scan of {Path(path).name} cancelled.")
+
+    return _scan
+
+
+def test_close_mid_scan_cancels_the_scan_and_accepts_the_close(
+    qapp: QApplication, make_window, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: `closeEvent` used to destroy a still-running scan QThread.
+
+    Qt aborts the process for that (``QThread: Destroyed while thread is still
+    running`` -> SIGABRT). The window must instead set the scan's cancel event,
+    let the thread wind down, and accept the close -- without popping an error
+    dialog for a failure the user themselves asked for.
+    """
+    entered = threading.Event()
+    monkeypatch.setattr(
+        workers_mod, "scan_spd", _blocking_scan(threading.Event(), entered, honour_cancel=True)
+    )
+    shown: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        MainWindow, "_show_error", lambda self, title, message: shown.append((title, message))
+    )
+
+    window = make_window()
+    window._load_spd(tmp_path / "huge.spd")
+    _spin_until(qapp, entered.is_set, timeout=15.0, what="the scan to reach the worker thread")
+    assert window._scan_thread is not None and window._scan_thread.isRunning()
+    assert window._scan_worker is not None
+
+    assert window.close() is True, "the close must be accepted, not deferred"
+    assert not window._scan_thread.isRunning(), "the thread must be joined before teardown"
+
+    for _ in range(10):
+        qapp.processEvents()
+    assert shown == [], "a cancelled scan is not an error -- no dialog"
+    assert "cancel" in window.status_label.text().lower()
+    assert window.session.scan is None
+
+
+def test_close_defers_when_a_scan_outlives_the_wait_instead_of_forcing_teardown(
+    qapp: QApplication, make_window, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A thread that ignores the cancel must postpone the close, not be destroyed.
+
+    `CLOSE_WAIT_MS` is shortened so the wait provably expires; the close is then
+    ignored and re-issued from the thread's own `finished` signal.
+    """
+    monkeypatch.setattr(main_window_mod, "CLOSE_WAIT_MS", 1)
+    release = threading.Event()
+    entered = threading.Event()
+    monkeypatch.setattr(
+        workers_mod, "scan_spd", _blocking_scan(release, entered, honour_cancel=False)
+    )
+    monkeypatch.setattr(MainWindow, "_show_error", lambda self, title, message: None)
+
+    window = make_window()
+    # isVisible() only reports meaningfully for a shown window (see the export
+    # cancel test), and it is how the deferred close is observed here.
+    window.show()
+    window._load_spd(tmp_path / "huge.spd")
+    _spin_until(qapp, entered.is_set, timeout=15.0, what="the scan to reach the worker thread")
+
+    assert window.close() is False, "the close must be deferred while the thread runs"
+    assert window.isVisible(), "the window stays up rather than tearing down a live QThread"
+    assert window._closing
+
+    release.set()
+    _spin_until(
+        qapp,
+        lambda: not window.isVisible(),
+        timeout=15.0,
+        what="the deferred close to land once the thread finished",
+    )
+    assert window._scan_thread is None
+
+
+# --------------------------------------------------------------------------- #
+# shared undo stack lifetime (regression: stale commands across sessions)
+# --------------------------------------------------------------------------- #
+
+
+def _push_voltage_edit(window: MainWindow, net: str, value: str) -> None:
+    model = window.net_tab.model
+    row = next(r for r in range(model.rowCount()) if model.net_for_row(r) == net)
+    col = model.column_index("voltage")
+    index = window.net_tab.proxy.mapFromSource(model.index(row, col))
+    window.net_tab.view.apply_bulk(value, index)
+
+
+def test_undo_stack_is_cleared_by_a_new_scan_and_by_a_config_load(
+    qapp: QApplication, make_window, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: the shared stack outlived the session its commands describe.
+
+    `BulkEditCommand`s hold row/column keys into the `Session` that was live
+    when they were pushed. Re-scanning a file (or overlaying a config JSON)
+    replaces that config wholesale, so an undo/redo afterwards wrote a stale
+    edit onto the *new* session -- and the toolbar's Undo stayed enabled,
+    advertising it.
+    """
+    window = make_window()
+    spd = tmp_path / "mini.spd"
+    build_mini_spd(spd, style="si")
+    _load_via_thread(qapp, window, spd)
+
+    _push_voltage_edit(window, POWER_NET_A, "3.3")
+    assert window.undo_stack.count() == 1
+    assert window.undo_action.isEnabled()
+
+    # a rescan rebuilds the session from disk ...
+    window._rescan()
+    _spin_until(qapp, lambda: not window._busy, timeout=15.0, what="rescan to finish")
+    assert window.undo_stack.count() == 0
+    assert not window.undo_stack.canUndo() and not window.undo_stack.canRedo()
+    assert not window.undo_action.isEnabled() and not window.redo_action.isEnabled()
+
+    # ... and so does opening a different file.
+    other = tmp_path / "other.spd"
+    build_mini_spd(other, style="dc")
+    _push_voltage_edit(window, POWER_NET_B, "2.5")
+    assert window.undo_stack.count() == 1
+    _load_via_thread(qapp, window, other)
+    assert window.undo_stack.count() == 0
+
+    # Load Config replaces the config wholesale too.
+    config_path = tmp_path / "config.json"
+    config_path.write_text(window.session.to_json(), encoding="utf-8")
+    _push_voltage_edit(window, POWER_NET_A, "1.8")
+    assert window.undo_stack.count() == 1
+
+    monkeypatch.setattr(
+        QFileDialog, "getOpenFileName", staticmethod(lambda *a, **k: (str(config_path), ""))
+    )
+    window._load_config()
+    assert "Loaded config" in window.status_label.text()
+    assert window.undo_stack.count() == 0
+    assert not window.undo_action.isEnabled()
+
+
+def test_failed_config_load_leaves_the_undo_stack_alone(
+    qapp: QApplication, make_window, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nothing was replaced, so the stack must survive (the clear is not blanket)."""
+    window = make_window()
+    spd = tmp_path / "mini.spd"
+    build_mini_spd(spd, style="si")
+    _load_via_thread(qapp, window, spd)
+    _push_voltage_edit(window, POWER_NET_A, "3.3")
+    assert window.undo_stack.count() == 1
+
+    monkeypatch.setattr(MainWindow, "_show_error", lambda self, title, message: None)
+    monkeypatch.setattr(
+        QFileDialog,
+        "getOpenFileName",
+        staticmethod(lambda *a, **k: (str(tmp_path / "missing.json"), "")),
+    )
+    window._load_config()
+    assert window.undo_stack.count() == 1

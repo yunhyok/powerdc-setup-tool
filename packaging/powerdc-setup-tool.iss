@@ -18,7 +18,10 @@ OutputBaseFilename=PowerDC-Setup-Tool-Setup-{#MyAppVersion}
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern
-ArchitecturesInstallIn64BitMode=x64compatible
+; `x64` is understood by every Inno Setup 6.x. The newer architecture-identifier
+; syntax that supersedes it arrived in 6.3 and is a hard compile error on
+; anything older, including whatever `choco install innosetup` pins in CI.
+ArchitecturesInstallIn64BitMode=x64
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
