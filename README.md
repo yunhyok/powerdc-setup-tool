@@ -85,6 +85,25 @@ uploads the installer as a build artifact, and -- for tag pushes only -- publish
 with the installer attached via `gh release create`. `scripts/publish_release.ps1` does the
 equivalent from a local checkout (creates the GitHub repo if needed, pushes, and creates the release).
 
+## Tests
+
+```bash
+QT_QPA_PLATFORM=offscreen pytest -m "not slow"   # what CI runs
+pytest -m slow                                   # 200 MB synthetic perf envelope
+```
+
+Two of them need extra context:
+
+- **`tests/test_perf.py`** builds a scaled synthetic `.spd` (`tests/fixtures.py:build_scaled_spd`;
+  ~200 MB, 92 rails, ~5k LGA pins, the real design's section proportions) and drives
+  scan -> `Session` -> `write_spd` in a child process, asserting the design targets: scan < 60 s,
+  write < 120 s, peak RSS < 256 MB. A ~20 MB version of the same run stays in the default selection
+  so CI catches gross regressions.
+- **`tests/test_real_extracts.py`** cross-validates the generated `.VRM` / `.Sink` / `.NetList` /
+  `.OtherCircuit` text byte-for-byte against staged extracts of a real Cadence design. Those
+  extracts are customer data and are **never committed**; the module skips itself when they are
+  absent (point `POWERDC_REAL_EXTRACTS` at a directory of them to run it).
+
 ## File-format notes
 
 Full grammar lives in the internal `spd_dc_format_spec.md` design notes; short summary:

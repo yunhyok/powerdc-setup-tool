@@ -20,9 +20,9 @@ cascade to repaint; chunk 5 can still call `apply_changed_keys` by hand after
 mutating the session directly.
 
 A mutator that adds or removes rows bumps `Session.structure_version`; seeing
-it move (or the row count move -- `Session._ensure_ground` can add a net row
-without bumping it) forces a full `refresh_from_session` reset instead of a
-cell patch.
+it move -- or the row count move, the belt-and-braces check kept for sessions
+mutated outside the mutator API -- forces a full `refresh_from_session` reset
+instead of a cell patch.
 """
 
 from __future__ import annotations
@@ -687,8 +687,9 @@ class BaseConfigModel(QAbstractTableModel):
             self.refresh_from_session()
             return
         if len(self._rows_provider(self.session)) != len(self._rows):
-            # `Session._ensure_ground` can add a net row without bumping
-            # `structure_version`; a count mismatch is the safety net.
+            # Every `Session` mutator that adds a row bumps `structure_version`
+            # (including `_ensure_ground` since chunk 7), so this is now only
+            # the safety net for a session mutated outside that API.
             self.refresh_from_session()
             return
 

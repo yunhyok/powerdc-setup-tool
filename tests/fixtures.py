@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Literal
+from typing import BinaryIO, Literal
 
 Style = Literal["si", "dc"]
 Newline = Literal["lf", "crlf"]
@@ -468,6 +468,269 @@ def expected_dc(
         text = text[:start] + body + text[end:]
 
     return text
+
+
+# ---------------------------------------------------------------------------
+# Scaled generator (design §E `test_perf`: "200 MB synthetic file")
+#
+# Proportions are taken from the real design's own offsets (see
+# `tests/test_real_extracts.py` and the staged `marks_si.txt`): in the 42.9 MB
+# SI file, geometry + the `.Connect` run occupy the first 2.0 MB (4.7 %), the
+# `.PowerSI` section runs 2.0 -> 42.5 MB (94 %, almost all of it `.Port`
+# continuation lines), and `.PowerDC` + `.NetList` + `.NetAlias` + tail share
+# the last 0.4 MB. The generator keeps those ratios and just scales the
+# `.PowerSI` filler until the file hits `target_bytes`.
+# ---------------------------------------------------------------------------
+
+#: spec §2 "colors cycle over 11 names" (kept local: `fixtures` imports nothing).
+COLOR_CYCLE: tuple[str, ...] = (
+    "RED", "GREEN", "YELLOW", "OLIVE", "FUCHSIA", "DARKRED",
+    "DARKMAGENTA", "DARKGREEN", "DARKCYAN", "DARKBLUE", "BLUE",
+)
+
+#: spec §6 voltage codes observed on the real design.
+_VOLTAGE_CODES: tuple[str, ...] = ("050", "055", "070", "075", "105", "120", "180")
+_RAILS: tuple[str, ...] = (
+    "VDDQ_DDRH", "VINT", "VP_HSIO", "VAON_SRAM", "VTRIP", "VDDA_P_CL5_P",
+    "VPH_CAM", "VIO_AON", "VQPS_SYS_0_AON", "VP_CAM12", "VDDA_DDRL_REF_CLK",
+)
+#: LGA pin names are `<letters><number>` (`FA134`, `Y99`); SITE pins are numeric.
+_PIN_COLUMNS: tuple[str, ...] = tuple(
+    prefix + letter
+    for prefix in ("", "A", "B", "C", "D", "E", "F")
+    for letter in "ABCDEFGHJKLMNPRTUVWY"
+)
+
+
+def scaled_power_net(index: int) -> str:
+    """`ADC_VDD_<ccc>_<rail>/<die>` -- the real naming shape (spec §6)."""
+    code = _VOLTAGE_CODES[index % len(_VOLTAGE_CODES)]
+    rail = _RAILS[(index // len(_VOLTAGE_CODES)) % len(_RAILS)]
+    return f"ADC_VDD_{code}_{rail}_{index // 2}/{index % 2}"
+
+
+def scaled_signal_net(index: int) -> str:
+    """`W_DDR<n>_BP_C<c>_DQ[<k>]/<die>` -- the real signal-net shape, unique per index."""
+    return f"W_DDR{index % 16}_BP_C{index // 512}_DQ[{index % 512}]/{index % 2}"
+
+
+def _lga_pin(i: int) -> str:
+    return f"{_PIN_COLUMNS[i % len(_PIN_COLUMNS)]}{i // len(_PIN_COLUMNS) + 1}"
+
+
+def _scaled_nets(power_count: int, net_count: int) -> tuple[list[str], list[str]]:
+    """(power nets, unclassified signal nets) -- `DGND` is the single ground."""
+    power = [scaled_power_net(i) for i in range(power_count)]
+    signals = [scaled_signal_net(i) for i in range(max(net_count - power_count - 1, 0))]
+    return power, signals
+
+
+def _scaled_pin_rows(
+    circuit: str,
+    node_base: int,
+    count: int,
+    ground: str,
+    power: list[str],
+    signals: list[str],
+) -> list[tuple[str, str, str]]:
+    """`(pin, node, net)` triples with the real file's ~60 % ground share.
+
+    *node_base* keeps node ids unique across circuits without relying on
+    `hash()`, which is salted per interpreter run -- the fixture must be
+    byte-reproducible so a perf number is comparable between runs.
+    """
+    numeric = not circuit.startswith("LGA")
+    rows: list[tuple[str, str, str]] = []
+    for i in range(count):
+        pin = str(9000 + i) if numeric else _lga_pin(i)
+        node = f"Node{node_base + i}"
+        slot = i % 5
+        if slot < 3:
+            net = ground
+        elif slot == 3 and power:
+            net = power[i % len(power)]
+        else:
+            net = signals[i % len(signals)] if signals else ground
+        rows.append((pin, node, net))
+    return rows
+
+
+def build_scaled_spd(
+    path: str | Path,
+    *,
+    target_bytes: int = 200 * 1024 * 1024,
+    nets: int = 3000,
+    power_nets: int = 92,
+    lga_pins: int = 5000,
+    site_pins: int = 2000,
+    caps: int = 200,
+    style: Style = "si",
+    newline: Newline = "lf",
+) -> dict[str, int]:
+    """Write a scaled but grammar-faithful `.spd` of roughly *target_bytes*.
+
+    Same grammar as `build_mini_spd` -- every anchor, directive and section the
+    scanner and writer depend on is present and in the real file's order -- but
+    sized for `tests/test_perf.py`. The file is streamed out in ~4 MB chunks, so
+    generating a 200 MB fixture costs a few MB of RAM, not 200.
+
+    Returns a stats dict (`bytes`, `power_nets`, `lga_pins`, ...) so the perf
+    test can report throughput without re-deriving the shape.
+    """
+    if style not in ("si", "dc"):
+        raise ValueError(f"style must be 'si' or 'dc', got {style!r}")
+    path = Path(path)
+    power, signals = _scaled_nets(power_nets, nets)
+    ground = GROUND_NET
+    cap_names = [f"C{i // 2 + 1}_{i % 2}" for i in range(caps)]
+
+    # spec ADDENDUM file order: the small parts first, the big circuits last.
+    circuits: list[tuple[str, str, list[tuple[str, str, str]]]] = []
+    for index, name in enumerate(cap_names):
+        die = int(name.rsplit("_", 1)[1])
+        pick = [net for net in power if net.endswith(f"/{die}")] or power
+        circuits.append(
+            (
+                name,
+                "CAP_0402_10UF",
+                [
+                    ("1", f"Node{7_000_000 + index}", pick[index % len(pick)]),
+                    ("2", f"Node{7_500_000 + index}", ground),
+                ],
+            )
+        )
+    for die in (0, 1):
+        die_power = [net for net in power if net.endswith(f"/{die}")] or power
+        circuits.append(
+            (
+                f"SITE{die}",
+                "DIE_SITE",
+                _scaled_pin_rows(
+                    f"SITE{die}", 2_000_000 + die * 1_000_000, site_pins, ground, die_power, []
+                ),
+            )
+        )
+    circuits.append(
+        ("LGA", "LGA_PKG", _scaled_pin_rows("LGA", 100_000, lga_pins, ground, power, signals))
+    )
+
+    def _connect_blocks() -> list[str]:
+        out: list[str] = []
+        for refdes, part, rows in circuits:
+            out.append(f".Connect {refdes} {part} Usage = 0b1000001000 Checked = 1")
+            out.extend(f"{pin} $Package.{node}!!{pin}::{net}" for pin, node, net in rows)
+            out.append(".EndC")
+            out.append("")
+        return out
+
+    def _netlist_lines() -> list[str]:
+        lines = [
+            "\t::Unselected||DropShape RiseTime = 0ps %Coupling = 0",
+            "\tGroundNets Color = LIME",
+            "\tPowerNets Color = RED",
+        ]
+        lines += [
+            f"\t{net}::Unselected||DropShape Color = {COLOR_CYCLE[i % 11]}"
+            for i, net in enumerate(signals)
+        ]
+        lines.append(f"\t{ground} -> GroundNets Color = GREEN Voltage = 0")
+        for i, net in enumerate(power):
+            arrow = " -> PowerNets" if i == 0 else ""
+            lines.append(f"\t{net}{arrow} Color = {COLOR_CYCLE[i % 11]}")
+        return lines
+
+    def _powerdc_lines() -> list[str]:
+        lines = [
+            "* PowerDC Setup description lines",
+            ".PowerDC PlotResolution = 0.000497 MeshX = 200 MeshY = 200 SimulationType = 1",
+            ".SignOffReportSetting VerticalRangeScale = 85",
+            "",
+            "* PowerLoss description lines",
+            "",
+            "* PdcElem description lines",
+        ]
+        if style == "dc":
+            lines += [f'.OtherCircuit Device = {n} Name = "{n}"' for n in sorted(cap_names)]
+        lines += ['.SpiceNetlist Name = "SPICENetlist"', ".EndSpiceNetlist", ""]
+        lines += [f"* {name} description lines" for name in _CONSTRAINT_NAMES]
+        lines.append(".EndPowerDC")
+        return lines
+
+    # -- the `.PowerSI` filler: real `.Port` continuation lines, repeated -----
+    head = [
+        _title_line(style).rstrip("\n"),
+        "* Geometry description lines",
+        *_cte_decoy().split("\n")[:-1],
+        "",
+        *_connect_blocks(),
+        *_comp_collection_section().split("\n")[:-1],
+        ".PowerSI",
+        ".MaxEdgeLength = 4.970000e-03",
+        ".ReferenceImpedance = 5.000000e+01",
+        ".DC_BBS_Setting DCFitted = 1 BBSFitted = 1 PDCEqualPotential = 0",
+        "",
+        "* Port description lines",
+        ".Port",
+    ]
+    tail = [
+        ".EndPort",
+        ".SimuOptionSettings DielectricBufferSize = 0.140604",
+        ".EndSimuOptionSettings",
+        ".EndPowerSI",
+        *_powerdc_lines(),
+        *_autoclassify_section().split("\n")[:-1],
+        ".NetList",
+        *_netlist_lines(),
+        ".EndNetList",
+        *_netalias_section().split("\n")[:-1],
+        *_tail().split("\n")[:-1],
+    ]
+
+    eol = "\r\n" if newline == "crlf" else "\n"
+
+    def _blen(lines: list[str]) -> int:
+        return sum(len(line.encode("utf-8")) + len(eol) for line in lines)
+
+    # The `.PowerSI` bulk: `.Port` continuation lines, copied from the real
+    # file's shape (a `+`-prefixed run of `$Package.<node>!!<pin>::<net>`).
+    # They deliberately fail `spd_scan`'s cheap first-byte gate, exactly as the
+    # real ones do -- that is the property design §G.5 relies on.
+    port_pin = "$Package.Node{n}!!{p}::" + (power[0] if power else ground)
+    filler_line = "+" + " " * 29 + " ".join(
+        port_pin.format(n=20040 + k, p=9004 + k) for k in range(4)
+    )
+    header_line = f"Port0_SITE0::{power[0] if power else ground} Auto GenFromCktInstance=\"SITE0\""
+    filler_size = len(filler_line.encode("utf-8")) + len(eol)
+    remaining = max(target_bytes - _blen(head) - _blen(tail), 0)
+    filler_count = remaining // filler_size
+
+    def _emit(handle: BinaryIO, lines: list[str]) -> None:
+        handle.write((eol.join(lines) + eol).encode("utf-8"))
+
+    written_filler = 0
+    with path.open("wb") as handle:
+        _emit(handle, head)
+        batch: list[str] = []
+        for i in range(filler_count):
+            batch.append(filler_line if i % 64 else header_line)
+            if len(batch) >= 20000:  # ~4 MB per write
+                _emit(handle, batch)
+                written_filler += len(batch)
+                batch = []
+        if batch:
+            _emit(handle, batch)
+            written_filler += len(batch)
+        _emit(handle, tail)
+
+    return {
+        "bytes": path.stat().st_size,
+        "nets": len(power) + len(signals) + 1,
+        "power_nets": len(power),
+        "lga_pins": lga_pins,
+        "site_pins": site_pins,
+        "circuits": len(circuits),
+        "filler_lines": written_filler,
+    }
 
 
 if __name__ == "__main__":

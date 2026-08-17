@@ -36,6 +36,7 @@ from fixtures import (  # noqa: E402
     UNCLASSIFIED_NETS,
     build_mini_spd,
 )
+from powerdc_setup_tool.core.model import PowerNetConfig  # noqa: E402
 from powerdc_setup_tool.core.session import Session, net_key, vrm_key  # noqa: E402
 from powerdc_setup_tool.core.spd_scan import scan_spd  # noqa: E402
 from powerdc_setup_tool.ui.delegates import ComboDelegate, NumericDelegate  # noqa: E402
@@ -974,24 +975,50 @@ def test_numeric_columns_accept_a_pasted_unit_suffix(session: Session) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_model_resets_when_session_grows_a_row_without_bumping_structure_version(
-    session: Session,
-) -> None:
-    """`Session._ensure_ground` adds a net row without touching
-    `structure_version`; the row-count check in `apply_changed_keys` is the net."""
+def test_model_resets_when_ensure_ground_adds_a_net_row(session: Session) -> None:
+    """`Session._ensure_ground` materializes a net row *and* bumps
+    `structure_version` (chunk 7 fix), so `apply_changed_keys` resets."""
     model = NetTableModel(session)
     before = model.rowCount()
     version = session.structure_version
 
     changed = session.set_paired_ground(POWER_NET_A, "BRAND_NEW_GND")
 
-    assert session.structure_version == version  # Session did not flag the addition
+    assert session.structure_version > version  # Session flags the addition itself
     assert len(session.nets) == before + 1
     resets: list[int] = []
     model.modelReset.connect(lambda: resets.append(1))
     model.apply_changed_keys(changed)
     assert resets and model.rowCount() == before + 1
     assert row_of(model, "BRAND_NEW_GND") >= 0
+
+
+def test_model_row_count_check_still_catches_an_unflagged_row(session: Session) -> None:
+    """The row-count safety net in `apply_changed_keys` survives the chunk 7 fix:
+    a session grown outside the mutator API still forces a full reset."""
+    model = NetTableModel(session)
+    before = model.rowCount()
+
+    # Bypass every mutator -- exactly what a hand-rolled caller would do.
+    session._add_net(PowerNetConfig(net="OFF_BOOKS_GND", net_class="ground"))
+    assert session.structure_version == model._structure_version
+
+    resets: list[int] = []
+    model.modelReset.connect(lambda: resets.append(1))
+    model.apply_changed_keys([(net_key(POWER_NET_A), "voltage")])
+    assert resets and model.rowCount() == before + 1
+
+
+def test_setdata_swallows_session_valueerror(session: Session) -> None:
+    """design §C: a rejected value is "skipped silently" -- `Session.set_class`'s
+    `ValueError` must never escape into the view (session issue (c))."""
+    model = NetTableModel(session)
+    row = row_of(model, UNCLASSIFIED_NETS[0])
+    index = model.index(row, NET_CLASS)
+
+    # An unknown class survives the enum parser; `Session.set_class` rejects it.
+    assert model.setData(index, "POWER_SUPPLY", Qt.ItemDataRole.EditRole) is False
+    assert session.nets[UNCLASSIFIED_NETS[0]].net_class == "none"
 
 
 def test_sorting_uses_edit_role_so_numbers_sort_numerically(session: Session) -> None:
@@ -1016,9 +1043,11 @@ def test_refresh_from_session_picks_up_out_of_band_edits(session: Session) -> No
 
     assert resets == [1]
     assert model.rowCount() == 3
-    # `Session.add_vrm_row` appends (only `_sync_rows` re-sorts into netlist order)
-    assert model.row_key(2) == vrm_key(POWER_NET_A, 1)
-    assert model.row_of_key(vrm_key(POWER_NET_A, 1)) == 2
+    # chunk 7: `add_vrm_row` places the row in netlist order immediately, so the
+    # second VRM of net A sits next to the first, not at the end of the table.
+    assert model.row_key(1) == vrm_key(POWER_NET_A, 1)
+    assert model.row_of_key(vrm_key(POWER_NET_A, 1)) == 1
+    assert model.row_key(2) == vrm_key(POWER_NET_B, 0)
 
 
 def test_base_model_is_generic_over_a_row_provider(session: Session) -> None:

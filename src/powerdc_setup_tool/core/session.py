@@ -71,6 +71,13 @@ Deliberate deviations / resolutions (call sites in `tests/test_session.py`)
   ``SITE{die}`` without the net does not win.
 * `autopair()`/`derive_all()` return their `ChangedKey` lists (the chunk-0 stub
   typed both as ``None``); `to_json` takes an `indent` keyword.
+* **Structural bookkeeping (chunk 7).** `_ensure_ground` can materialize a
+  brand-new Net Manager row (a ground net that the `.NetList` never mentioned),
+  so it bumps `structure_version` like every other row-adding mutator;
+  `ui/models.py` keeps its row-count safety net for sessions mutated by hand.
+  `_sort_rows` is called by every row-adding path -- `add_vrm_row`/
+  `add_sink_row` included -- so a row's table position is always netlist order
+  (design §D block order) and never depends on when it was created.
 """
 
 from __future__ import annotations
@@ -690,6 +697,12 @@ class Session:
             cfg = PowerNetConfig(net=gnet, net_class=CLASS_GROUND, die=naming.die_of(gnet))
             cfg.voltage = self._auto_net_voltage(cfg)
             self._add_net(cfg)
+            # A brand-new Net Manager row *is* a structural change: a model that
+            # only patched cells would keep a stale row list (design §B "a
+            # mutator that adds or removes rows additionally bumps
+            # `structure_version`"). `load`/`apply_json` bump once themselves,
+            # so the extra bumps they trigger here are harmless.
+            self.structure_version += 1
         elif cfg.net_class == CLASS_NONE:
             cfg.net_class = CLASS_GROUND
             if not cfg.voltage_override:
@@ -748,13 +761,22 @@ class Session:
                 )
                 changed = True
 
+        self._sort_rows()
+        if changed:
+            self.structure_version += 1
+        return changed
+
+    def _sort_rows(self) -> None:
+        """Put VRM/Sink rows in `PowerNets` netlist order (design §D block order).
+
+        Every path that adds a row calls this, so a row's position never depends
+        on *when* it was created -- `add_vrm_row`/`add_sink_row` land where
+        `_sync_rows` would have put them, not at the end of the table.
+        """
         rank = {net: i for i, net in enumerate(self._ordered_nets())}
         limit = len(rank)
         self._vrms.sort(key=lambda r: (rank.get(r.net, limit), r.net, r.row_id))
         self._sinks.sort(key=lambda r: (rank.get(r.net, limit), r.net, r.row_id))
-        if changed:
-            self.structure_version += 1
-        return changed
 
     def _propagate(self, nets: Iterable[str] | None = None) -> None:
         """Recompute every non-overridden derived field (design §B)."""
@@ -990,6 +1012,7 @@ class Session:
                 row_id=row_id,
             )
         )
+        self._sort_rows()
         self.structure_version += 1
         self._propagate([net])
         return vrm_key(net, row_id)
@@ -1007,6 +1030,7 @@ class Session:
                 row_id=row_id,
             )
         )
+        self._sort_rows()
         self.structure_version += 1
         self._propagate([net])
         return sink_key(net, row_id)
@@ -1278,10 +1302,7 @@ class Session:
             if row is not None:
                 self._sinks.append(row)
 
-        rank = {net: i for i, net in enumerate(self._ordered_nets())}
-        limit = len(rank)
-        self._vrms.sort(key=lambda r: (rank.get(r.net, limit), r.net, r.row_id))
-        self._sinks.sort(key=lambda r: (rank.get(r.net, limit), r.net, r.row_id))
+        self._sort_rows()
         return self._diff(before)
 
     @staticmethod

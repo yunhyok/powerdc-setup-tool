@@ -530,6 +530,88 @@ def test_extra_rows_get_dedup_suffixes_and_survive_derive_all(tmp_path: Path) ->
 
 
 # --------------------------------------------------------------------------- #
+# chunk 7 regressions: structural bookkeeping
+# --------------------------------------------------------------------------- #
+
+
+def test_ensure_ground_bumps_structure_version_when_it_adds_a_net_row(
+    tmp_path: Path,
+) -> None:
+    """A paired ground the `.NetList` never mentioned materializes a brand-new
+    Net Manager row -- a structural change models must reset for, not patch."""
+    session = _session(tmp_path)
+    before_rows = len(session.nets)
+    version = session.structure_version
+
+    session.set_paired_ground(POWER_NET_A, "BRAND_NEW_GND")
+
+    assert len(session.nets) == before_rows + 1
+    assert session.structure_version > version
+    assert session.nets["BRAND_NEW_GND"].net_class == "ground"
+    assert session.nets["BRAND_NEW_GND"].voltage == 0.0
+
+    # An *existing* net promoted to ground adds no row -> no further bump.
+    version = session.structure_version
+    session.set_paired_ground(POWER_NET_B, "BRAND_NEW_GND")
+    assert session.structure_version == version
+
+
+def test_ensure_ground_bumps_through_a_per_row_ground_edit(tmp_path: Path) -> None:
+    """`set_field(..., "gnet", ...)` reaches `_ensure_ground` too."""
+    session = _session(tmp_path)
+    version = session.structure_version
+    session.set_field(vrm_key(POWER_NET_A), "gnet", "SIDEBAND_GND")
+    assert "SIDEBAND_GND" in session.nets
+    assert session.structure_version > version
+
+
+def test_added_rows_land_in_netlist_order_immediately(tmp_path: Path) -> None:
+    """`add_vrm_row`/`add_sink_row` place the row where `_sync_rows` would --
+    the design §D block order -- without waiting for a later `derive_all`."""
+    session = _session(tmp_path)
+    assert [r.net for r in session.vrm_rows] == [POWER_NET_A, POWER_NET_B]
+
+    key = session.add_vrm_row(POWER_NET_A)
+    assert key == vrm_key(POWER_NET_A, 1)
+    assert [(r.net, r.row_id) for r in session.vrm_rows] == [
+        (POWER_NET_A, 0),
+        (POWER_NET_A, 1),
+        (POWER_NET_B, 0),
+    ]
+    sink = session.add_sink_row(POWER_NET_A)
+    assert sink == sink_key(POWER_NET_A, 1)
+    assert [(r.net, r.row_id) for r in session.sink_rows] == [
+        (POWER_NET_A, 0),
+        (POWER_NET_A, 1),
+        (POWER_NET_B, 0),
+    ]
+
+    # ... and `derive_all` is a no-op on the ordering (it was already correct).
+    order = [(r.net, r.row_id) for r in session.vrm_rows]
+    session.derive_all()
+    assert [(r.net, r.row_id) for r in session.vrm_rows] == order
+
+
+def test_added_rows_are_exported_in_netlist_order(tmp_path: Path) -> None:
+    """The immediate placement is what `build_plan` emits (design §D step 5)."""
+    session = _session(tmp_path)
+    session.add_vrm_row(POWER_NET_A)
+    plan = session.build_plan()
+    assert [cfg.net for cfg, _pos, _neg in plan.vrms] == [
+        POWER_NET_A,
+        POWER_NET_A,
+        POWER_NET_B,
+    ]
+
+
+def test_add_row_bumps_structure_version(tmp_path: Path) -> None:
+    session = _session(tmp_path)
+    version = session.structure_version
+    session.add_sink_row(POWER_NET_B)
+    assert session.structure_version > version
+
+
+# --------------------------------------------------------------------------- #
 # validate (design §C export flow, §G.3/§G.4)
 # --------------------------------------------------------------------------- #
 
