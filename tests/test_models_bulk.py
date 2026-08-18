@@ -49,6 +49,8 @@ from powerdc_setup_tool.ui.models import (  # noqa: E402
     KIND_TEXT,
     KIND_VOLTAGE,
     OVERRIDE_COLOR,
+    SORT_ROLE,
+    ConfigSortProxy,
     NetFilterProxy,
     NetTableModel,
     SinkTableModel,
@@ -160,7 +162,9 @@ def test_net_table_columns_match_design(session: Session) -> None:
     # design §C column 2/3 choice providers.
     power_row = row_of(model, POWER_NET_A)
     assert model.choices_for(model.index(power_row, NET_CLASS)) == ["power", "ground", "none"]
-    assert model.choices_for(model.index(power_row, NET_GND)) == [GROUND_NET]
+    # v0.1.2: a leading blank entry so the pairing is always clearable and the
+    # combo is never an empty box (see `_ground_choices`).
+    assert model.choices_for(model.index(power_row, NET_GND)) == ["", GROUND_NET]
     # "Paired GND ... combo (power rows only)"
     assert model.is_editable(model.index(power_row, NET_GND))
     assert not model.is_editable(model.index(row_of(model, UNCLASSIFIED_NETS[0]), NET_GND))
@@ -172,9 +176,13 @@ def test_net_table_derived_columns(session: Session) -> None:
     assert texts(model, row) == [
         "1", POWER_NET_A, "power", GROUND_NET, "0.7", "0", "3", "2", "input"
     ]
-    # a net only the `.NetList` knows: 0 pins on both components, source "new".
+    # v0.1.2 Source column: an unclassified net has no origin at all (0.1.1
+    # called every net the `.NetList` did not classify "new").
     sense = row_of(model, SENSE_NETS[0])
-    assert texts(model, sense, (NET_PVRM, NET_PSINK, NET_SRC)) == ["0", "0", "new"]
+    assert texts(model, sense, (NET_PVRM, NET_PSINK, NET_SRC)) == ["0", "0", ""]
+    assert model.headerData(NET_SRC, Qt.Orientation.Horizontal, Qt.ItemDataRole.ToolTipRole) == (
+        "Where this net's class came from"
+    )
 
 
 def test_vrm_and_sink_table_columns_match_design(session: Session) -> None:
@@ -659,6 +667,197 @@ def test_bulk_edit_through_the_filter_proxy(session: Session) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# header-click sorting (v0.1.2)
+# --------------------------------------------------------------------------- #
+
+
+def sorted_view(model, proxy=None) -> tuple[BulkEditTableView, object]:
+    """A sorting-enabled view over *model*, wired the way the real tabs are."""
+    proxy = proxy if proxy is not None else ConfigSortProxy()
+    proxy.setSourceModel(model)
+    view = BulkEditTableView()
+    view.setModel(proxy)
+    view.enable_header_sorting()
+    return view, proxy
+
+
+def shown_nets(model, proxy) -> list[str]:
+    return [
+        model.net_for_row(proxy.mapToSource(proxy.index(row, 0)).row())
+        for row in range(proxy.rowCount())
+    ]
+
+
+def test_enabling_sorting_leaves_the_table_in_netlist_order(session: Session) -> None:
+    """`setSortingEnabled(True)` re-sorts by the indicator's section, which
+    defaults to 0 -- so the indicator is parked on -1 first (design §D order)."""
+    model = NetTableModel(session)
+    view, proxy = sorted_view(model)
+
+    assert view.horizontalHeader().sortIndicatorSection() == -1
+    assert shown_nets(model, proxy) == [model.net_for_row(r) for r in range(model.rowCount())]
+
+
+def test_sorting_a_numeric_column_orders_numerically_not_as_text(session: Session) -> None:
+    model = NetTableModel(session)
+    view, proxy = sorted_view(model)
+    # 10 V sorts above 9 V only if the raw number is compared: as text "10"
+    # would land between "1.2" and "9".
+    session.set_net_voltage(UNCLASSIFIED_NETS[0], 10.0)
+    session.set_net_voltage(UNCLASSIFIED_NETS[1], 9.0)
+    model.refresh_from_session()
+
+    view.sortByColumn(NET_V, Qt.SortOrder.AscendingOrder)
+    ascending = [proxy.index(row, NET_V).data(SORT_ROLE) for row in range(proxy.rowCount())]
+    assert ascending == sorted(ascending)
+    assert ascending[-2:] == [9.0, 10.0]
+    assert view.horizontalHeader().sortIndicatorSection() == NET_V
+
+    view.sortByColumn(NET_V, Qt.SortOrder.DescendingOrder)
+    descending = [proxy.index(row, NET_V).data(SORT_ROLE) for row in range(proxy.rowCount())]
+    assert descending == list(reversed(ascending))
+    assert view.horizontalHeader().sortIndicatorOrder() == Qt.SortOrder.DescendingOrder
+
+    # DisplayRole is the formatted text; SORT_ROLE is what ordering used.
+    assert proxy.index(0, NET_V).data(Qt.ItemDataRole.DisplayRole) == "10"
+    assert proxy.index(0, NET_V).data(SORT_ROLE) == 10.0
+
+
+def test_sorting_is_stable_on_equal_values(session: Session) -> None:
+    """Ties keep source order, so a sort is reproducible rather than arbitrary."""
+    model = NetTableModel(session)
+    _view, proxy = sorted_view(model)
+    proxy.sort(NET_DIE, Qt.SortOrder.AscendingOrder)
+
+    die_none = [net for net in shown_nets(model, proxy) if session.nets[net].die is None]
+    source_order = [
+        model.net_for_row(row)
+        for row in range(model.rowCount())
+        if session.nets[model.net_for_row(row)].die is None
+    ]
+    assert die_none == source_order
+
+
+def test_vrm_and_sink_numeric_columns_sort_numerically(session: Session) -> None:
+    vrm_model = VrmTableModel(session)
+    view, proxy = sorted_view(vrm_model)
+    session.set_field(vrm_key(POWER_NET_A), "output_current", 12.0)
+    session.set_field(vrm_key(POWER_NET_B), "output_current", 3.0)
+    vrm_model.refresh_from_session()
+
+    view.sortByColumn(VRM_CUR, Qt.SortOrder.AscendingOrder)
+    assert [proxy.index(r, VRM_CUR).data(SORT_ROLE) for r in range(proxy.rowCount())] == [3.0, 12.0]
+    assert shown_nets(vrm_model, proxy) == [POWER_NET_B, POWER_NET_A]
+
+    sink_view, sink_proxy = sorted_view(SinkTableModel(session))
+    sink_view.sortByColumn(SINK_NOM, Qt.SortOrder.DescendingOrder)
+    noms = [sink_proxy.index(r, SINK_NOM).data(SORT_ROLE) for r in range(sink_proxy.rowCount())]
+    assert noms == [1.2, 0.7]
+
+
+def test_bulk_type_to_fill_after_sorting_hits_the_selected_rows(session: Session) -> None:
+    """The delegate commits to the anchor *before* the bulk signal, and that
+    commit re-sorts the proxy: the anchor has to be recovered by row key."""
+    model = NetTableModel(session)
+    view, proxy = sorted_view(model)
+    view.sortByColumn(NET_V, Qt.SortOrder.DescendingOrder)
+
+    picked = shown_nets(model, proxy)[:2]
+    select(view, (0, NET_V), (1, NET_V), current=(0, NET_V))
+    anchor = proxy.index(0, NET_V)
+
+    # exactly what `NumericDelegate.setModelData` does, in that order
+    view.note_pending_edit(anchor)
+    proxy.setData(anchor, "0.05", Qt.ItemDataRole.EditRole)
+    assert shown_nets(model, proxy)[:2] != picked  # the commit moved the anchor row
+    assert view.apply_bulk("0.05", anchor) == 2
+
+    assert [session.nets[net].voltage for net in picked] == [0.05, 0.05]
+    untouched = [net for net in session.nets if net not in picked]
+    assert all(session.nets[net].voltage != 0.05 for net in untouched)
+
+
+def test_undo_after_re_sorting_restores_the_rows_it_touched(session: Session) -> None:
+    """A `BulkEditCommand` holds `Session` row keys, so re-sorting between the
+    edit and the Ctrl+Z cannot make it write to the wrong rows."""
+    model = NetTableModel(session)
+    view, proxy = sorted_view(model)
+    view.sortByColumn(NET_NET, Qt.SortOrder.AscendingOrder)
+
+    picked = shown_nets(model, proxy)[:2]
+    before = [session.nets[net].voltage for net in picked]
+    select(view, (0, NET_V), (1, NET_V), current=(0, NET_V))
+    assert view.apply_bulk("0.42", proxy.index(0, NET_V)) == 2
+    assert [session.nets[net].voltage for net in picked] == [0.42, 0.42]
+
+    # re-sort by the very column that was edited, then undo
+    view.sortByColumn(NET_V, Qt.SortOrder.DescendingOrder)
+    view.undo_stack.undo()
+
+    assert [session.nets[net].voltage for net in picked] == before
+    assert [session.nets[net].voltage_override for net in picked] == [False, False]
+
+    view.sortByColumn(NET_DIE, Qt.SortOrder.AscendingOrder)
+    view.undo_stack.redo()
+    assert [session.nets[net].voltage for net in picked] == [0.42, 0.42]
+
+
+def test_check_toggle_and_go_to_net_survive_a_sort(session: Session) -> None:
+    model = NetTableModel(session)
+    view, proxy = sorted_view(model)
+    view.sortByColumn(NET_NET, Qt.SortOrder.DescendingOrder)
+
+    target = shown_nets(model, proxy)[0]
+    assert session.nets[target].selected is True
+    assert view.toggle_cells([proxy.index(0, NET_USE)]) == 1
+    assert session.nets[target].selected is False
+    view.undo_stack.undo()
+    assert session.nets[target].selected is True
+
+    jumped: list[str] = []
+    view.goToNetRequested.connect(jumped.append)
+    view.setCurrentIndex(proxy.index(0, NET_NET))
+    view.go_to_net()
+    assert jumped == [target]
+
+
+def test_check_all_shown_covers_the_filter_not_the_selection(session: Session) -> None:
+    """v0.1.2: "shown" is what the proxy lets through; hidden rows keep their state."""
+    model = NetTableModel(session)
+    proxy = NetFilterProxy()
+    view, _ = sorted_view(model, proxy)
+    proxy.setClassFilter("Power")
+    assert proxy.rowCount() == 2
+
+    messages: list[str] = []
+    view.statusMessage.connect(messages.append)
+    # nothing selected at all, and one hidden row is explicitly checked
+    assert session.nets[UNCLASSIFIED_NETS[0]].selected is True
+
+    assert view.check_all_shown(False) == 2
+    assert session.nets[POWER_NET_A].selected is False
+    assert session.nets[POWER_NET_B].selected is False
+    assert session.nets[UNCLASSIFIED_NETS[0]].selected is True  # hidden -> untouched
+    assert messages == ["Unchecked 2 shown rows."]
+
+    # one undoable command each
+    assert view.undo_stack.count() == 1
+    view.undo_stack.undo()
+    assert session.nets[POWER_NET_A].selected is True
+
+    view.undo_stack.redo()
+    assert view.check_all_shown(True) == 2
+    assert session.nets[POWER_NET_A].selected is True
+    assert messages[-1] == "Checked 2 shown rows."
+
+    # already all-checked -> nothing to do, and nothing pushed
+    pushed = view.undo_stack.count()
+    assert view.check_all_shown(True) == 0
+    assert view.undo_stack.count() == pushed
+    assert messages[-1] == "No shown rows to check."
+
+
+# --------------------------------------------------------------------------- #
 # write-through to Session (design §B / §C)
 # --------------------------------------------------------------------------- #
 
@@ -789,6 +988,9 @@ def test_context_menu_offers_every_design_entry(session: Session) -> None:
         "Reset to auto",
         "Check selected",
         "Uncheck selected",
+        # v0.1.2: the filter-wide companions of Check/Uncheck selected.
+        "Check all (shown)",
+        "Uncheck all (shown)",
         "Set paired ground…",
         "Go to net",
     ]
@@ -964,6 +1166,75 @@ def test_combo_delegate_offers_session_choices_and_rejects_typos(session: Sessio
     editor.setCurrentText("ground")
     delegate.setModelData(editor, model, index)
     assert session.nets[POWER_NET_A].net_class == "ground"
+
+
+def _combo_items(view, model, index) -> list[str]:
+    from PySide6.QtWidgets import QStyleOptionViewItem
+
+    delegate = view.itemDelegateForColumn(index.column())
+    assert isinstance(delegate, ComboDelegate)
+    editor = delegate.createEditor(view.viewport(), QStyleOptionViewItem(), index)
+    delegate.setEditorData(editor, index)
+    return [editor.itemText(i) for i in range(editor.count())]
+
+
+def test_paired_gnd_combo_is_never_empty_and_is_built_when_the_editor_opens(
+    session: Session,
+) -> None:
+    """v0.1.2 bug fix: the Paired GND drop-down came up with nothing in it."""
+    model = NetTableModel(session)
+    view, proxy = sorted_view(model)
+    index = proxy.mapFromSource(model.index(row_of(model, POWER_NET_A), NET_GND))
+
+    assert _combo_items(view, model, index) == ["", GROUND_NET]
+
+    # A net classified ground *after* the model was built is offered at once --
+    # the provider runs at editor-creation time, not at construction time.
+    # (`Session.ground_nets` orders by the `.NetList`, so the new one leads.)
+    session.set_class(UNCLASSIFIED_NETS[0], "ground")
+    assert _combo_items(view, model, index) == ["", UNCLASSIFIED_NETS[0], GROUND_NET]
+
+    # ...and the row's own value is always in the list, even when the session
+    # no longer calls it a ground.
+    session.nets[POWER_NET_A].paired_gnd = "GND_FROM_A_BLOCK"
+    assert "GND_FROM_A_BLOCK" in _combo_items(view, model, index)
+
+
+def test_paired_gnd_combo_still_offers_the_blank_when_nothing_is_a_ground(
+    session: Session,
+) -> None:
+    """The v0.1.1 failure state: a session where no net is classified ground."""
+    for net in session.ground_nets():
+        session.set_class(net, "none")
+    session.set_class(POWER_NET_A, "power")
+    assert session.ground_nets() == []
+
+    model = NetTableModel(session)
+    view = view_for(model)
+    index = model.index(row_of(model, POWER_NET_A), NET_GND)
+
+    # The row still points at its old ground, which the second guard keeps
+    # offering even though the session no longer classifies it as one.
+    assert model.choices_for(index) == ["", GROUND_NET]
+
+    # With nothing classified *and* nothing paired -- the exact state a freshly
+    # scanned, unclassified `.spd` used to open in -- 0.1.1 produced `[]` here,
+    # i.e. a combo the user could pick nothing from. The blank entry is the floor.
+    session.nets[POWER_NET_A].paired_gnd = ""
+    assert model.choices_for(index) == [""]
+    assert _combo_items(view, model, index) == [""]
+
+    # ...and "Set paired ground…" says so instead of silently doing nothing.
+    messages: list[str] = []
+    view.statusMessage.connect(messages.append)
+    view._prompt_paired_ground()
+    assert messages == ["No ground nets yet — classify one first."]
+
+
+def test_vrm_and_sink_ground_combos_use_the_same_provider(session: Session) -> None:
+    for model, column in ((VrmTableModel(session), VRM_GND), (SinkTableModel(session), VRM_GND)):
+        view = view_for(model)
+        assert _combo_items(view, model, model.index(0, column)) == ["", GROUND_NET]
 
 
 def test_numeric_delegate_edits_without_a_spin_box(session: Session) -> None:

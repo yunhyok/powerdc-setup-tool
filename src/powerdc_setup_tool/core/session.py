@@ -83,6 +83,16 @@ Deliberate deviations / resolutions (call sites in `tests/test_session.py`)
   `_sort_rows` is called by every row-adding path -- `add_vrm_row`/
   `add_sink_row` included -- so a row's table position is always netlist order
   (design §D block order) and never depends on when it was created.
+* **Classification origin (v0.1.2).** `PowerNetConfig.class_source` answers the
+  Net Manager's *Source* column -- "where did this net's class come from?" --
+  with ``"input"`` (the `.NetList`'s own `PowerNets`/`GroundNets` membership,
+  or an existing `.VRM`/`.Sink` block, i.e. everything `load` preloads),
+  ``"auto"`` (`auto_classify_by_name`, or `_ensure_ground` promoting a net
+  because something paired to it), ``"user"`` (`set_class`, the only mutator a
+  hand edit reaches) and ``""`` while the net is unclassified. It rides in
+  `_NET_FIELDS`, so a change to it comes back as a `ChangedKey` and `to_json`
+  carries it for free; `_migrated_class_source` reconstructs it from
+  ``from_input`` when a 0.1.1 config is loaded.
 """
 
 from __future__ import annotations
@@ -121,6 +131,10 @@ __all__ = [
     "CONFIG_VERSION",
     "DEFAULT_VOLTAGE",
     "DEFAULT_CURRENT",
+    "SOURCE_INPUT",
+    "SOURCE_AUTO",
+    "SOURCE_USER",
+    "SOURCE_NONE",
 ]
 
 # (row_key, field) -- ui/models.py maps these to concrete (row, col) indices.
@@ -138,6 +152,17 @@ CLASS_POWER = "power"
 CLASS_GROUND = "ground"
 CLASS_NONE = "none"
 _CLASSES = (CLASS_POWER, CLASS_GROUND, CLASS_NONE)
+
+#: v0.1.2 `PowerNetConfig.class_source` -- the Net Manager's *Source* column.
+#: ``SOURCE_INPUT`` is written by `load` for a net the `.NetList` itself put in
+#: `PowerNets`/`GroundNets`, ``SOURCE_AUTO`` by every automatic pass
+#: (`auto_classify_by_name`, `_ensure_ground`), ``SOURCE_USER`` by `set_class`.
+#: An unclassified net carries ``SOURCE_NONE`` (the empty string).
+SOURCE_INPUT = "input"
+SOURCE_AUTO = "auto"
+SOURCE_USER = "user"
+SOURCE_NONE = ""
+_SOURCES = (SOURCE_INPUT, SOURCE_AUTO, SOURCE_USER, SOURCE_NONE)
 
 #: design §C P/G pairing UX: ground candidates are the nets already in
 #: `GroundNets` **plus** the nets whose name matches this pattern.
@@ -195,6 +220,7 @@ _NET_FIELDS = (
     "selected",
     "die",
     "from_input",
+    "class_source",
 )
 _VRM_FIELDS = (
     "gnet",
@@ -383,6 +409,23 @@ def _listed(names: Iterable[str], limit: int = 8) -> str:
     return ", ".join(items[:limit]) + f" and {len(items) - limit} more"
 
 
+def _migrated_class_source(cfg: PowerNetConfig) -> str:
+    """`PowerNetConfig.class_source` for a config restored from JSON (v0.1.2).
+
+    A config written by 0.1.1 has no ``class_source`` at all, so the field is
+    reconstructed from the two facts that release *did* save: an unclassified
+    net has no origin, and a classified one is ``"input"`` exactly when
+    ``from_input`` says the file classified it. Anything else was the tool's
+    own doing, which is ``"auto"`` -- never ``"user"``, because guessing a hand
+    edit that the old format never recorded would be a lie.
+    """
+    if cfg.net_class == CLASS_NONE:
+        return SOURCE_NONE
+    if cfg.class_source in (SOURCE_INPUT, SOURCE_AUTO, SOURCE_USER):
+        return cfg.class_source
+    return SOURCE_INPUT if cfg.from_input else SOURCE_AUTO
+
+
 class Session:
     """Owns all `*Config` state derived from a `ScanResult` plus user edits."""
 
@@ -430,6 +473,8 @@ class Session:
                 selected=True,
                 die=naming.die_of(name),
                 from_input=net_class != CLASS_NONE,
+                # v0.1.2 Source column: the `.NetList` group *is* the origin.
+                class_source=SOURCE_INPUT if net_class != CLASS_NONE else SOURCE_NONE,
             )
             cfg.voltage = self._auto_net_voltage(cfg)
             for key, value in entry.attrs:
@@ -477,6 +522,7 @@ class Session:
                     net_class=CLASS_POWER,
                     die=naming.die_of(block.net),
                     from_input=True,
+                    class_source=SOURCE_INPUT,
                 )
                 cfg.voltage = self._auto_net_voltage(cfg)
                 self._add_net(cfg)
@@ -486,6 +532,9 @@ class Session:
             if cfg.net_class != CLASS_POWER:
                 cfg.net_class = CLASS_POWER
                 cfg.from_input = True
+                # An existing `.VRM`/`.Sink` block is input-provided classification
+                # just as much as a `PowerNets` membership is (§G.2).
+                cfg.class_source = SOURCE_INPUT
                 cfg.voltage = self._auto_net_voltage(cfg)
             # design §C: "each net's ground comes from its parsed block name".
             if block.gnet:
@@ -588,8 +637,20 @@ class Session:
         return [n for n in self._ordered_nets() if self.nets[n].net_class == CLASS_POWER]
 
     def ground_nets(self) -> list[str]:
-        """Nets classified ground -- the Paired GND combo's model (design §C)."""
+        """Nets classified ground -- the Paired GND combo's model (design §C).
+
+        Live, not cached: `ui/models.py`'s Paired GND / Ground columns call this
+        every time an editor opens, so a net classified ground a moment ago is
+        offered immediately (v0.1.2).
+        """
         return [n for n in self._ordered_nets() if self.nets[n].net_class == CLASS_GROUND]
+
+    def class_source(self, net: str) -> str:
+        """v0.1.2 *Source* column: ``"input"``/``"auto"``/``"user"``/``""``."""
+        cfg = self.nets.get(net)
+        if cfg is None or cfg.net_class == CLASS_NONE:
+            return SOURCE_NONE
+        return cfg.class_source if cfg.class_source in _SOURCES else SOURCE_NONE
 
     def rows_for(self, net: str) -> list[VrmConfig | SinkConfig]:
         """Every VRM/Sink row belonging to *net*."""
@@ -756,7 +817,14 @@ class Session:
         """A net used as a paired ground must be in `GroundNets` (spec §2)."""
         cfg = self.nets.get(gnet)
         if cfg is None:
-            cfg = PowerNetConfig(net=gnet, net_class=CLASS_GROUND, die=naming.die_of(gnet))
+            cfg = PowerNetConfig(
+                net=gnet,
+                net_class=CLASS_GROUND,
+                die=naming.die_of(gnet),
+                # The tool decided this net is a ground, not the file or the
+                # user picking it from the Class cell (v0.1.2 Source column).
+                class_source=SOURCE_AUTO,
+            )
             cfg.voltage = self._auto_net_voltage(cfg)
             self._add_net(cfg)
             # A brand-new Net Manager row *is* a structural change: a model that
@@ -767,6 +835,7 @@ class Session:
             self.structure_version += 1
         elif cfg.net_class == CLASS_NONE:
             cfg.net_class = CLASS_GROUND
+            cfg.class_source = SOURCE_AUTO
             if not cfg.voltage_override:
                 cfg.voltage = self._auto_net_voltage(cfg)
 
@@ -910,6 +979,7 @@ class Session:
             if guess is None:
                 continue
             cfg.net_class = guess
+            cfg.class_source = SOURCE_AUTO  # v0.1.2 Source column
             if guess != CLASS_POWER:
                 cfg.paired_gnd = ""  # same invariant `set_class` keeps
             if not cfg.voltage_override:
@@ -964,7 +1034,14 @@ class Session:
         return self._diff(before, [net])
 
     def set_class(self, net: str, net_class: str) -> list[ChangedKey]:
-        """Set `PowerNetConfig.net_class` (``"power"``/``"ground"``/``"none"``)."""
+        """Set `PowerNetConfig.net_class` (``"power"``/``"ground"``/``"none"``).
+
+        This is the *user* entry point (the Class cell, the right-click
+        *Classify* submenu), so it stamps `class_source` as ``"user"`` -- and
+        clears it back to ``""`` when the net becomes unclassified again. The
+        automatic passes (`auto_classify_by_name`, `_ensure_ground`) set the
+        field directly and never come through here (v0.1.2 Source column).
+        """
         value = str(net_class).strip().lower()
         if value not in _CLASSES:
             raise ValueError(f"net_class must be one of {_CLASSES}, got {net_class!r}")
@@ -977,6 +1054,7 @@ class Session:
         scope.discard("")
         before = self._snapshot(scope)
         cfg.net_class = value
+        cfg.class_source = SOURCE_NONE if value == CLASS_NONE else SOURCE_USER
         if value != CLASS_POWER:
             cfg.paired_gnd = ""
         self._sync_rows()
@@ -1383,6 +1461,7 @@ class Session:
             for field in _NET_FIELDS:
                 if field in item:
                     setattr(cfg, field, self._restore(cfg, field, item[field]))
+            cfg.class_source = _migrated_class_source(cfg)
             self._add_net(cfg)
 
         for item in payload.get("vrms") or ():
@@ -1405,6 +1484,9 @@ class Session:
         if field == "net_class":
             text = str(value).strip().lower()
             return text if text in _CLASSES else CLASS_NONE
+        if field == "class_source":
+            text = str(value or "").strip().lower()
+            return text if text in _SOURCES else SOURCE_NONE
         if isinstance(current, bool):
             return bool(value)
         if isinstance(current, float):

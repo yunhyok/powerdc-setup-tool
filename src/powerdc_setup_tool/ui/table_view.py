@@ -24,6 +24,17 @@ The one ordering subtlety: design §C has the delegate commit to `currentIndex`
 *before* it emits `bulkApplyRequested`, so by the time the view builds the
 command the anchor cell's old value is already gone. `edit()` snapshots it on
 the way in (`note_pending_edit`), which is the only pre-commit hook Qt gives us.
+
+Sorting (v0.1.2)
+----------------
+All three tables now sit behind a `ConfigSortProxy` and `enable_header_sorting`
+turns click-to-sort on. Row *numbers* are therefore view state, not identity,
+which is exactly the case `BulkEditCommand` was already built for -- it stores
+`Session` row keys, so an operation, its undo and its redo all address the same
+rows however the view is ordered in between. Two places did still hold a row
+number across a model write and were moved onto keys: `note_pending_edit`
+(`_PendingEdit.row_key`) and `apply_bulk`'s anchor, because the delegate's
+commit re-sorts the proxy *before* `bulkApplyRequested` reaches the view.
 """
 
 from __future__ import annotations
@@ -93,6 +104,22 @@ class _CellChange:
     @property
     def is_reset(self) -> bool:
         return self.new is RESET_TO_AUTO
+
+
+@dataclass(frozen=True)
+class _PendingEdit:
+    """The anchor cell's pre-edit state, snapshotted by `edit()` (design §C).
+
+    Addressed by `Session` row key, not by row number: under v0.1.2's header
+    sorting the delegate's commit can re-sort the proxy *between* the commit and
+    the `bulkApplyRequested` that follows it, which moves the edited row out
+    from under the `QModelIndex` the delegate is still holding.
+    """
+
+    row_key: str
+    column: int
+    old: Any
+    old_override: bool
 
 
 class BulkEditCommand(QUndoCommand):
@@ -188,6 +215,8 @@ class BulkEditTableView(QTableView):
     pairedGroundRequested = Signal(str)
     #: cell count of the bulk operation that was just pushed (status bar).
     bulkApplied = Signal(int)
+    #: v0.1.2 ready-to-show status-bar line ("Checked 37 shown rows.").
+    statusMessage = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -208,7 +237,7 @@ class BulkEditTableView(QTableView):
 
         self._undo_stack = QUndoStack(self)
         self._owns_undo_stack = True
-        self._pending_edit: tuple[tuple[int, int], Any, bool] | None = None
+        self._pending_edit: _PendingEdit | None = None
         self._auto_delegates = True
         self._delegates: list[Any] = []
         self._delegate_columns: list[int] = []
@@ -244,6 +273,22 @@ class BulkEditTableView(QTableView):
             self._undo_stack.clear()
         if self._auto_delegates:
             self.install_default_delegates()
+
+    def enable_header_sorting(self) -> None:
+        """Turn on click-to-sort with an indicator, starting *unsorted* (v0.1.2).
+
+        `QTableView.setSortingEnabled(True)` immediately re-sorts by whatever
+        the header's sort indicator points at, and that defaults to section 0 --
+        the *Use* checkbox, which would scramble netlist order the moment a
+        table is built. Parking the indicator on -1 first makes the initial
+        `sortByColumn` a no-op (`QSortFilterProxyModel.sort(-1)` = source
+        order), so the first ordering the user sees is still design §D's.
+        """
+        header = self.horizontalHeader()
+        header.setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
+        header.setSortIndicatorShown(True)
+        header.setSectionsClickable(True)
+        self.setSortingEnabled(True)
 
     def setExtraMenuBuilder(self, builder: Callable[[QMenu], None] | None) -> None:
         """Install a hook that prepends tab-specific entries to the context menu.
@@ -346,15 +391,23 @@ class BulkEditTableView(QTableView):
 
         Called from `edit()`; the delegate commits to the model before it emits
         `bulkApplyRequested`, so this is where the anchor cell's undo state
-        comes from.
+        comes from. The snapshot is keyed by `Session` row key so it survives
+        the re-sort that commit can trigger (v0.1.2 header sorting).
         """
-        if not index.isValid() or self.config_model() is None:
+        model = self.config_model()
+        if not index.isValid() or model is None:
             self._pending_edit = None
             return
-        self._pending_edit = (
-            (index.row(), index.column()),
-            self._read(index),
-            self._is_override(index),
+        local = source_index(index)
+        row_key = model.row_key(local.row())
+        if not row_key:
+            self._pending_edit = None
+            return
+        self._pending_edit = _PendingEdit(
+            row_key=row_key,
+            column=local.column(),
+            old=self._read(index),
+            old_override=self._is_override(index),
         )
 
     @Slot(object, QModelIndex)
@@ -365,11 +418,26 @@ class BulkEditTableView(QTableView):
         A selection spanning *Nominal V* + *Sense V* fills both; non-matching
         kinds, read-only cells and cells the value will not parse for are
         skipped silently.
+
+        Everything is resolved to **source** indices up front. The delegate has
+        already committed to the anchor cell by the time this runs, and under
+        v0.1.2's header sorting that commit can re-sort the proxy, so the
+        anchor's `QModelIndex` may now point at a different row; the pending
+        snapshot's `Session` row key is what the anchor is recovered from.
         """
         model = self.config_model()
         spec = self._spec(index.column()) if index.isValid() else None
         if model is None or spec is None:
             return 0
+
+        pending = self._pending_edit
+        self._pending_edit = None
+
+        anchor = QModelIndex()
+        if pending is not None and pending.column == index.column():
+            anchor = model.index_for_key(pending.row_key, pending.column)
+        if not anchor.isValid():
+            anchor = source_index(index)
 
         targets: list[QModelIndex] = []
         seen: set[tuple[int, int]] = set()
@@ -377,26 +445,29 @@ class BulkEditTableView(QTableView):
             other = self._spec(candidate.column())
             if other is None or other.kind != spec.kind:
                 continue
-            if not self._is_editable(candidate):
+            local = source_index(candidate)
+            if not local.isValid() or not self._is_editable(local):
                 continue
-            cell = (candidate.row(), candidate.column())
+            cell = (local.row(), local.column())
             if cell not in seen:
                 seen.add(cell)
-                targets.append(candidate)
-        anchor = (index.row(), index.column())
-        if anchor not in seen and self._is_editable(index):
-            targets.append(index)
+                targets.append(local)
+        if (
+            anchor.isValid()
+            and (anchor.row(), anchor.column()) not in seen
+            and self._is_editable(anchor)
+        ):
+            targets.append(anchor)
 
-        pending = self._pending_edit
-        self._pending_edit = None
+        anchor_cell = (anchor.row(), anchor.column()) if anchor.isValid() else None
 
         changes: list[tuple[Any, ...]] = []
         for target in targets:
             ok, parsed = model.parse_value(target, value)
             if not ok:
                 continue
-            if pending is not None and pending[0] == (target.row(), target.column()):
-                old, was_override = pending[1], pending[2]
+            if pending is not None and anchor_cell == (target.row(), target.column()):
+                old, was_override = pending.old, pending.old_override
             else:
                 old, was_override = self._read(target), self._is_override(target)
             changes.append((target, old, parsed, was_override))
@@ -557,7 +628,13 @@ class BulkEditTableView(QTableView):
         `currentIndex`, clipped to bounds."""
         return self.paste_grid(self.parse_clipboard_grid(QGuiApplication.clipboard().text()))
 
-    def toggle_cells(self, indexes: Iterable[QModelIndex], checked: bool | None = None) -> int:
+    def toggle_cells(
+        self,
+        indexes: Iterable[QModelIndex],
+        checked: bool | None = None,
+        *,
+        text: str = "Toggle",
+    ) -> int:
         """Set every editable bool cell in *indexes* to *checked* (or flip each)."""
         changes: list[tuple[Any, ...]] = []
         for index in indexes:
@@ -566,7 +643,7 @@ class BulkEditTableView(QTableView):
                 continue
             old = bool(self._read(index))
             changes.append((index, old, (not old) if checked is None else bool(checked), False))
-        return self._push(changes, "Toggle")
+        return self._push(changes, text)
 
     def _toggle_selected_bools(self) -> int:
         """Space: toggle all selected bool cells to the inverse of the anchor cell."""
@@ -629,6 +706,35 @@ class BulkEditTableView(QTableView):
                 for row in sorted({i.row() for i in self._selected_indexes()})
             ]
         return self.toggle_cells(indexes, checked=checked)
+
+    def check_all_shown(self, checked: bool) -> int:
+        """"Check/Uncheck all (shown)": the Use column of every *visible* row (v0.1.2).
+
+        "Shown" is what the filter proxy currently lets through -- filter to
+        ``*_070_*``, uncheck all shown, and the 3600 hidden rows keep their
+        state. The selection is deliberately ignored: this is the companion of
+        *Check selected*, for the case where selecting the whole filtered set
+        first is the tedious part. Still one `BulkEditCommand`, so one Ctrl+Z
+        puts every row back.
+        """
+        column = self._bool_column()
+        model = self.model()
+        if column < 0 or model is None:
+            return 0
+        indexes = [
+            index
+            for row in range(model.rowCount())
+            if (index := self._index(row, column)).isValid()
+        ]
+        count = self.toggle_cells(
+            indexes, checked=checked, text="Check all shown" if checked else "Uncheck all shown"
+        )
+        verb = "Checked" if checked else "Unchecked"
+        if count:
+            self.statusMessage.emit(f"{verb} {count} shown row{'' if count == 1 else 's'}.")
+        else:
+            self.statusMessage.emit(f"No shown rows to {verb.lower()[:-2]}.")
+        return count
 
     def set_paired_ground_for_selection(self, gnet: str) -> int:
         """"Set paired ground…": write *gnet* into the ground column of every
@@ -696,6 +802,9 @@ class BulkEditTableView(QTableView):
             return
         grounds = list(model.session.ground_nets())
         if not grounds:
+            # Say so rather than opening a dialog with an empty list -- the same
+            # dead end the v0.1.2 Paired GND combo fix is about.
+            self.statusMessage.emit("No ground nets yet — classify one first.")
             return
         gnet, ok = QInputDialog.getItem(self, "Set paired ground", "Ground net:", grounds, 0, False)
         if ok and gnet:
@@ -793,6 +902,8 @@ class BulkEditTableView(QTableView):
             ("Reset to auto", self.reset_selection_to_auto),
             ("Check selected", lambda: self.check_selection(True)),
             ("Uncheck selected", lambda: self.check_selection(False)),
+            ("Check all (shown)", lambda: self.check_all_shown(True)),
+            ("Uncheck all (shown)", lambda: self.check_all_shown(False)),
             (None, None),
             ("Set paired ground…", self._prompt_paired_ground),
             ("Go to net", self.go_to_net),
@@ -808,7 +919,8 @@ class BulkEditTableView(QTableView):
 
     def contextMenuEvent(self, event: QContextMenuEvent) -> None:
         """Set value... / Fill Down / Fill Right / Copy / Paste / Reset to auto /
-        Check-Uncheck selected / Set paired ground... / Go to net."""
+        Check-Uncheck selected / Check-Uncheck all (shown) / Set paired ground... /
+        Go to net."""
         index = self.indexAt(event.pos())
         selection = self.selectionModel()
         if index.isValid() and selection is not None and not selection.isSelected(index):

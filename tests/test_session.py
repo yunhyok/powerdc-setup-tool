@@ -599,6 +599,110 @@ def test_auto_classify_by_name_keeps_a_user_voltage_override() -> None:
     assert session.nets[AUTO_POWER_NET].voltage_override is True
 
 
+# --------------------------------------------------------------------------- #
+# `class_source` -- the v0.1.2 Source column
+# --------------------------------------------------------------------------- #
+
+
+def test_class_source_is_input_for_what_the_netlist_classified(tmp_path: Path) -> None:
+    session = _session(tmp_path)
+    assert session.class_source(POWER_NET_A) == "input"
+    assert session.class_source(GROUND_NET) == "input"
+    # An unclassified net has no origin at all -- 0.1.1 called it "new".
+    assert session.class_source(UNCLASSIFIED_NETS[0]) == ""
+    assert session.class_source(SENSE_NETS[0]) == ""
+    assert session.class_source("no such net") == ""
+
+
+def test_class_source_input_survives_edits_that_leave_the_class_alone(tmp_path: Path) -> None:
+    """"input stays input": only a *class* change moves the origin."""
+    session = _session(tmp_path)
+    session.set_net_voltage(POWER_NET_A, 0.95)
+    session.set_paired_ground(POWER_NET_A, GROUND_NET)
+    session.set_selected(POWER_NET_A, False)
+    session.auto_classify_by_name()
+    session.autopair(force=True)
+    session.derive_all()
+
+    assert session.class_source(POWER_NET_A) == "input"
+    assert session.class_source(GROUND_NET) == "input"
+
+
+def test_class_source_is_auto_for_the_name_pass_and_user_after_a_hand_edit() -> None:
+    session = Session()
+    session.load(_auto_classify_scan())
+    assert session.class_source(AUTO_POWER_NET) == ""  # unclassified on load
+
+    session.auto_classify_by_name()
+    assert session.class_source(AUTO_POWER_NET) == "auto"
+    assert session.class_source(AUTO_GROUND_NET) == "auto"
+    assert session.class_source(CLASSIFIED_POWER_NET) == "input"  # the file's own marker
+
+    # auto -> user: a hand edit takes ownership, even back to the same class.
+    session.set_class(AUTO_POWER_NET, "power")
+    assert session.class_source(AUTO_POWER_NET) == "user"
+    # input -> user, likewise.
+    session.set_class(CLASSIFIED_POWER_NET, "ground")
+    assert session.class_source(CLASSIFIED_POWER_NET) == "user"
+    # ...and unclassifying clears the origin entirely.
+    session.set_class(AUTO_POWER_NET, "none")
+    assert session.class_source(AUTO_POWER_NET) == ""
+    assert session.nets[AUTO_POWER_NET].class_source == ""
+
+
+def test_class_source_is_auto_for_a_ground_materialized_by_pairing(tmp_path: Path) -> None:
+    """A net promoted to ground by `_ensure_ground` is the tool's doing, not a hand edit."""
+    session = _session(tmp_path)
+    session.set_class(UNCLASSIFIED_NETS[0], "power")
+    session.set_paired_ground(UNCLASSIFIED_NETS[0], "GND_NEW")
+
+    assert session.nets["GND_NEW"].net_class == "ground"
+    assert session.class_source("GND_NEW") == "auto"
+    assert session.class_source(UNCLASSIFIED_NETS[0]) == "user"
+
+
+def test_class_source_round_trips_through_json(tmp_path: Path) -> None:
+    session = _session(tmp_path)
+    session.auto_classify_by_name()
+    session.set_class(UNCLASSIFIED_NETS[0], "power")
+
+    restored = Session.from_json(session.to_json())
+
+    assert restored.class_source(POWER_NET_A) == "input"
+    assert restored.class_source(UNCLASSIFIED_NETS[0]) == "user"
+    assert restored.class_source(UNCLASSIFIED_NETS[1]) == ""
+    assert _config_payload(restored) == _config_payload(session)
+
+
+def test_apply_json_reconstructs_class_source_for_a_pre_v012_config() -> None:
+    """A 0.1.1 config has no `class_source`; `from_input` is what it knew instead."""
+    data = """
+    {
+      "version": 1,
+      "nets": [
+        {"net": "VDD/0", "net_class": "power", "from_input": true},
+        {"net": "VDD_AUTO/1", "net_class": "power", "from_input": false},
+        {"net": "SIG", "net_class": "none", "from_input": false},
+        {"net": "BOGUS", "net_class": "power", "class_source": "nonsense"}
+      ],
+      "vrms": [], "sinks": []
+    }
+    """
+    session = Session.from_json(data)
+    assert session.class_source("VDD/0") == "input"
+    assert session.class_source("VDD_AUTO/1") == "auto"
+    assert session.class_source("SIG") == ""
+    # An unreadable value degrades to "the tool did it", never to "the user did".
+    assert session.class_source("BOGUS") == "auto"
+
+
+def test_class_source_change_is_reported_as_a_changed_key(tmp_path: Path) -> None:
+    """`ui/models.py` repaints the Source column off this key."""
+    session = _session(tmp_path)
+    changed = session.set_class(UNCLASSIFIED_NETS[0], "power")
+    assert (net_key(UNCLASSIFIED_NETS[0]), "class_source") in _keys(changed)
+
+
 def test_auto_classify_by_name_changes_nothing_on_a_fully_classified_file(
     tmp_path: Path,
 ) -> None:

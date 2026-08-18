@@ -23,6 +23,18 @@ A mutator that adds or removes rows bumps `Session.structure_version`; seeing
 it move -- or the row count move, the belt-and-braces check kept for sessions
 mutated outside the mutator API -- forces a full `refresh_from_session` reset
 instead of a cell patch.
+
+v0.1.2
+------
+* **Header-click sorting** (`ConfigSortProxy`, which `NetFilterProxy` now
+  subclasses). It sorts on `SORT_ROLE`, i.e. the raw `ColumnSpec` value, so
+  *Voltage (V)* / *Die* / *Pins @…* order numerically rather than as text.
+* **Paired GND / Ground choices** come from `_ground_choices`, which always
+  carries a blank entry plus the row's own value, so the combo is never the
+  empty box v0.1.1 showed on a session with nothing classified ground yet.
+* **`ColumnSpec.tooltip`** -- static header/cell help text; the *Source* column
+  uses it, and it now reports `Session.class_source` (``input``/``auto``/
+  ``user``/``""``) instead of the old ``input``/``new`` split of `from_input`.
 """
 
 from __future__ import annotations
@@ -62,7 +74,9 @@ __all__ = [
     "NetTableModel",
     "VrmTableModel",
     "SinkTableModel",
+    "ConfigSortProxy",
     "NetFilterProxy",
+    "SORT_ROLE",
     "KIND_BOOL",
     "KIND_TEXT",
     "KIND_ENUM",
@@ -108,6 +122,14 @@ _INVALID = object()
 
 _NET_CLASSES: tuple[str, ...] = ("power", "ground", "none")
 
+#: v0.1.2 header-click sorting: the role `ConfigSortProxy` sorts on. It hands
+#: back the **raw** `ColumnSpec` value -- a `float`/`int`/`bool`, not the
+#: `DisplayRole` text -- so *Voltage (V)* orders 0.7 < 1.2 < 10 instead of
+#: "0.7" < "1.2" < "10" landing "10" between "1.2" and "2". `EditRole` would
+#: do for the editable columns, but the derived read-only ones (*Pins @VRM
+#: comp*, *Die*, *Name*, *Source*) are exactly the ones a user sorts by.
+SORT_ROLE = int(Qt.ItemDataRole.UserRole) + 1
+
 
 # --------------------------------------------------------------------------- #
 # Small helpers
@@ -151,6 +173,37 @@ def _circuit_names(session: Session) -> list[str]:
         return []
     names = [info.name for info in scan.circuits]
     return names or sorted(scan.pin_maps.by_circuit)
+
+
+def _ground_choices(field: str) -> Callable[[Session, Any], list[str]]:
+    """Choices provider for the Paired GND / Ground combos (v0.1.2 bug fix).
+
+    `ComboDelegate` calls this **when it builds the editor**, so the list is
+    whatever `Session.ground_nets()` says at that instant: a net classified
+    ground a moment ago (right-click *Classify > as GroundNets*) is offered on
+    the very next editor open, with no model rebuild.
+
+    v0.1.1 handed `session.ground_nets()` straight to `QComboBox.addItems`,
+    which made the editor *literally empty* whenever nothing was classified
+    ground yet -- the state every freshly scanned, unclassified `.spd` used to
+    land in, since nothing classified anything at load time. Two guards keep
+    that from ever being a dead end again:
+
+    * a leading blank entry, so the pairing can always be cleared, and so the
+      combo has a selectable row even on a session with no grounds at all;
+    * the row's own current value, so a ground that is no longer classified
+      (a hand-edited config, a `.VRM` block naming a net the `.NetList` never
+      grouped) still shows what the cell holds instead of reading as empty.
+    """
+
+    def choices(session: Session, row: Any) -> list[str]:
+        grounds = list(session.ground_nets())
+        current = str(getattr(row, field, "") or "")
+        if current and current not in grounds:
+            grounds.append(current)
+        return ["", *grounds]
+
+    return choices
 
 
 def _auto_net_voltage(session: Session, cfg: PowerNetConfig) -> float:
@@ -224,6 +277,9 @@ class ColumnSpec:
     #: optional overrides of the kind-based default text<->value conversion.
     parser: Callable[[str], Any] | None = None
     formatter: Callable[[Any], str] | None = None
+    #: v0.1.2 static help text for the header and for cells with nothing else
+    #: to say (an override tooltip and a validation issue both outrank it).
+    tooltip: str = ""
 
     # -- the stub published `header`; `title` is the design §C wording -------- #
     @property
@@ -431,12 +487,16 @@ class BaseConfigModel(QAbstractTableModel):
         orientation: Qt.Orientation,
         role: int = Qt.ItemDataRole.DisplayRole,
     ) -> Any:
-        if role != Qt.ItemDataRole.DisplayRole:
+        if orientation != Qt.Orientation.Horizontal:
+            return section + 1 if role == Qt.ItemDataRole.DisplayRole else None
+        spec = self.column_spec(section)
+        if spec is None:
             return None
-        if orientation == Qt.Orientation.Horizontal:
-            spec = self.column_spec(section)
-            return spec.title if spec is not None else None
-        return section + 1
+        if role == Qt.ItemDataRole.DisplayRole:
+            return spec.title
+        if role == Qt.ItemDataRole.ToolTipRole:
+            return spec.tooltip or None
+        return None
 
     def flags(self, index: QModelIndex) -> Qt.ItemFlag:
         if not index.isValid():
@@ -514,6 +574,12 @@ class BaseConfigModel(QAbstractTableModel):
         if role == Qt.ItemDataRole.EditRole:
             return spec.get(self.session, cfg, key)
 
+        if role == SORT_ROLE:
+            # v0.1.2 header-click sorting: the raw value, so a numeric column
+            # orders numerically. `EditRole` is the same value for the editable
+            # columns; the read-only ones have no `EditRole` of their own.
+            return spec.get(self.session, cfg, key)
+
         if role == Qt.ItemDataRole.CheckStateRole:
             if spec.kind != KIND_BOOL:
                 return None
@@ -540,7 +606,9 @@ class BaseConfigModel(QAbstractTableModel):
                     return f"User-set (auto value: {spec.format(auto)}{unit})"
                 return "User-set"
             problems = self._issue_map().get(cfg.net)
-            return "\n".join(problems) if problems else None
+            if problems:
+                return "\n".join(problems)
+            return spec.tooltip or None
 
         if role == Qt.ItemDataRole.BackgroundRole:
             if self.highlight_issues and cfg.net in self._issue_map():
@@ -824,7 +892,7 @@ class NetTableModel(BaseConfigModel):
             "Paired GND",
             KIND_ENUM,
             editable=True,
-            choices=lambda session, _cfg: session.ground_nets(),
+            choices=_ground_choices("paired_gnd"),
             enabled_for=lambda _s, cfg: cfg.net_class == "power",
         ),
         ColumnSpec(
@@ -842,14 +910,19 @@ class NetTableModel(BaseConfigModel):
             "source",
             "Source",
             KIND_TEXT,
-            getter=lambda _s, cfg, _k: "input" if cfg.from_input else "new",
+            getter=lambda session, cfg, _k: session.class_source(cfg.net),
+            tooltip="Where this net's class came from",
         ),
     )
 
     def _build_field_map(self) -> None:
         super()._build_field_map()
-        # design §C column 8 is derived from `from_input`.
-        self._col_of_field.setdefault("from_input", self.column_index("source"))
+        # design §C column 8 is derived state, not a field of its own: v0.1.2
+        # reads `class_source` (0.1.1 read `from_input`), and both must repaint
+        # it, since `apply_changed_keys` spans only the columns it is handed.
+        source_column = self.column_index("source")
+        self._col_of_field.setdefault("class_source", source_column)
+        self._col_of_field.setdefault("from_input", source_column)
 
 
 class VrmTableModel(BaseConfigModel):
@@ -873,7 +946,7 @@ class VrmTableModel(BaseConfigModel):
             "Ground",
             KIND_ENUM,
             editable=True,
-            choices=lambda session, _cfg: session.ground_nets(),
+            choices=_ground_choices("gnet"),
             pinned=True,
             auto_value=_auto_gnet,
         ),
@@ -944,7 +1017,7 @@ class SinkTableModel(BaseConfigModel):
             "Ground",
             KIND_ENUM,
             editable=True,
-            choices=lambda session, _cfg: session.ground_nets(),
+            choices=_ground_choices("gnet"),
             pinned=True,
             auto_value=_auto_gnet,
         ),
@@ -997,11 +1070,51 @@ class SinkTableModel(BaseConfigModel):
 
 
 # --------------------------------------------------------------------------- #
-# Filter proxy (design §C Net Manager top row)
+# Sort proxy (v0.1.2 header-click sorting) + filter proxy (design §C)
 # --------------------------------------------------------------------------- #
 
 
-class NetFilterProxy(QSortFilterProxyModel):
+class ConfigSortProxy(QSortFilterProxyModel):
+    """Header-click sorting for the three config tables (v0.1.2).
+
+    All three tables now sit behind one of these -- the Net Manager through
+    `NetFilterProxy`, which subclasses it -- so a click on any header sorts the
+    rows and `BulkEditTableView` sees a proxy in every tab. Nothing downstream
+    has to care: a `BulkEditCommand` addresses cells by stable `Session` row key
+    (see `ui/table_view.py`), so an edit, an undo and a redo all land on the row
+    the user picked no matter how the view is ordered in between.
+
+    Sorting is on `SORT_ROLE` (raw values, so numeric columns order
+    numerically), and `lessThan` breaks ties on the *source* row, which keeps
+    equal cells in netlist order instead of an arbitrary one and makes a sort
+    reproducible between runs.
+    """
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self.setDynamicSortFilter(True)
+        self.setSortRole(SORT_ROLE)
+
+    def lessThan(self, left: QModelIndex, right: QModelIndex) -> bool:
+        a = left.data(self.sortRole())
+        b = right.data(self.sortRole())
+        if a is None or b is None:
+            if a is None and b is None:
+                return left.row() < right.row()
+            return b is not None  # empties sort first, ascending
+        try:
+            if a == b:
+                return left.row() < right.row()
+            return bool(a < b)
+        except TypeError:
+            pass  # mixed types (a cleared numeric cell next to a filled one)
+        text_a, text_b = str(a), str(b)
+        if text_a == text_b:
+            return left.row() < right.row()
+        return text_a < text_b
+
+
+class NetFilterProxy(ConfigSortProxy):
     """Space-separated AND terms, `*` glob, case-insensitive (design §C filter box),
     plus the class combo's All/Power/Ground/Unclassified/Selected/Errors modes."""
 
@@ -1028,12 +1141,10 @@ class NetFilterProxy(QSortFilterProxyModel):
     _GLOB_CHARS = "*?["
 
     def __init__(self, parent: QObject | None = None) -> None:
-        super().__init__(parent)
+        super().__init__(parent)  # `ConfigSortProxy` sets the sort role
         self._terms: tuple[str, ...] = ()
         self._expression = ""
         self._mode = self.MODE_ALL
-        self.setDynamicSortFilter(True)
-        self.setSortRole(Qt.ItemDataRole.EditRole)
 
     # -- filter state ---------------------------------------------------- #
 
@@ -1107,13 +1218,3 @@ class NetFilterProxy(QSortFilterProxyModel):
         if any(char in term for char in cls._GLOB_CHARS):
             return fnmatch.fnmatchcase(haystack, term)
         return term in haystack
-
-    def lessThan(self, left: QModelIndex, right: QModelIndex) -> bool:
-        a = left.data(self.sortRole())
-        b = right.data(self.sortRole())
-        if a is None or b is None:
-            return b is not None
-        try:
-            return bool(a < b)
-        except TypeError:
-            return str(a) < str(b)

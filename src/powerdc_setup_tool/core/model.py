@@ -64,6 +64,11 @@ class PowerNetConfig:
     selected: bool = True
     die: int | None = None
     from_input: bool = False
+    #: v0.1.2 Source column -- where `net_class` came from: ``"input"`` (the
+    #: loaded `.NetList` already classified it), ``"auto"`` (the tool's own
+    #: name-based/pairing pass did), ``"user"`` (a hand edit did) or ``""``
+    #: (still unclassified). `core/session.py` is the only writer.
+    class_source: str = ""
 
 
 @dataclass

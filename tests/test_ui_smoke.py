@@ -31,6 +31,7 @@ from collections.abc import Callable, Iterator  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 import pytest  # noqa: E402
+from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtGui import QUndoStack  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication,
@@ -38,6 +39,7 @@ from PySide6.QtWidgets import (  # noqa: E402
     QFileDialog,
     QInputDialog,
     QMessageBox,
+    QStyleOptionViewItem,
 )
 
 from fixtures import (  # noqa: E402
@@ -54,7 +56,13 @@ from powerdc_setup_tool.core.spd_scan import ScanCancelled, scan_spd  # noqa: E4
 from powerdc_setup_tool.ui import main_window as main_window_mod  # noqa: E402
 from powerdc_setup_tool.ui import workers as workers_mod  # noqa: E402
 from powerdc_setup_tool.ui.main_window import APP_TITLE, MainWindow, _ExportOptionsDialog  # noqa: E402
-from powerdc_setup_tool.ui.models import NetTableModel, SinkTableModel, VrmTableModel  # noqa: E402
+from powerdc_setup_tool.ui.models import (  # noqa: E402
+    SORT_ROLE,
+    NetTableModel,
+    SinkTableModel,
+    VrmTableModel,
+    source_index,
+)
 from powerdc_setup_tool.ui.net_manager import NetManagerTab  # noqa: E402
 from powerdc_setup_tool.ui.sink_tab import SinkTab  # noqa: E402
 from powerdc_setup_tool.ui.vrm_tab import VrmTab  # noqa: E402
@@ -217,7 +225,10 @@ def test_scan_worker_populates_session_and_counts_label(
     assert window.net_tab.model.rowCount() == counts["nets"]
     assert window.vrm_tab.model.rowCount() == counts["power"]
     assert window.sink_tab.model.rowCount() == counts["power"]
-    assert "mini.spd" in window.status_label.text()
+    # v0.1.2 status line: "Loaded: N nets", plus the auto-classify tally only
+    # when the load-time pass actually moved something (it does not here: the
+    # miniature's `.NetList` already classifies both rails and the ground).
+    assert window.status_label.text() == f"Loaded: {counts['nets']} nets"
 
 
 def test_scan_worker_strong_ref_regression(qapp: QApplication, make_window, tmp_path: Path) -> None:
@@ -387,6 +398,11 @@ def test_go_to_net_jumps_and_selects_across_tabs(
     _load_via_thread(qapp, window, spd)
 
     window.tabs.setCurrentWidget(window.vrm_tab)
+    # v0.1.2: every tab is sorted, and a sort that moves the target row is what
+    # would break a jump that took a view row for a model row.
+    window.vrm_tab.view.sortByColumn(
+        window.vrm_tab.model.column_index("net"), Qt.SortOrder.DescendingOrder
+    )
     window.vrm_tab.view.goToNetRequested.emit(POWER_NET_A)
 
     assert window.tabs.currentWidget() is window.net_tab
@@ -396,8 +412,9 @@ def test_go_to_net_jumps_and_selects_across_tabs(
     current = net_view.currentIndex()
     assert proxy.index(current.row(), net_col).data() == POWER_NET_A
 
-    assert window.vrm_tab.model.net_for_row(window.vrm_tab.view.currentIndex().row()) == POWER_NET_A
-    assert window.sink_tab.model.net_for_row(window.sink_tab.view.currentIndex().row()) == POWER_NET_A
+    for tab in (window.vrm_tab, window.sink_tab):
+        current = tab.view.currentIndex()
+        assert tab.model.net_for_row(source_index(current).row()) == POWER_NET_A
 
 
 # --------------------------------------------------------------------------- #
@@ -733,6 +750,194 @@ def test_net_manager_auto_classify_toolbar_action(
     assert window.session.nets[POWER_NET_B].paired_gnd == GROUND_NET
     assert window.status_label.text() == "Auto-classify: +1 power, +0 ground"
     assert _net_class(window.net_tab.model, POWER_NET_A) == "power"
+
+
+# --------------------------------------------------------------------------- #
+# v0.1.2: auto-classification at load time
+# --------------------------------------------------------------------------- #
+
+
+def test_loading_an_unclassified_spd_classifies_it_before_the_first_repaint(
+    qapp: QApplication, make_window, tmp_path: Path
+) -> None:
+    """The field-reported case: a `.spd` PowerSI never classified used to open
+    as N unclassified rows -- no power nets, no VRM/Sink rows, no grounds."""
+    window = make_window()
+    spd = tmp_path / "unclassified.spd"
+    build_mini_spd(spd, style="si", classified=False)
+
+    # the load-time pass is the only thing that classifies here
+    reference = Session()
+    reference.load(scan_spd(spd))
+    assert reference.counts()["power"] == 0 and reference.counts()["ground"] == 0
+
+    painted: list[int] = []
+    window.net_tab.model.modelReset.connect(
+        lambda: painted.append(window.session.counts()["power"])
+    )
+    _load_via_thread(qapp, window, spd)
+
+    counts = window.session.counts()
+    assert (counts["power"], counts["ground"]) == (2, 1)
+    assert window.session.nets[POWER_NET_A].net_class == "power"
+    assert window.session.nets[GROUND_NET].net_class == "ground"
+    assert window.session.nets[POWER_NET_A].paired_gnd == GROUND_NET
+    # ...and the VRM/Sink tabs already have their rows
+    assert window.vrm_tab.model.rowCount() == 2
+    assert window.sink_tab.model.rowCount() == 2
+    # the classes were in place *before* the first model reset painted anything
+    assert painted and all(power == 2 for power in painted)
+
+    assert window.status_label.text() == (
+        f"Loaded: {counts['nets']} nets · auto-classified +2 power +1 ground"
+    )
+    # signal + `_PS`/`_GS` sense nets stay out of it (§G.4)
+    for net in (*UNCLASSIFIED_NETS, *SENSE_NETS):
+        assert window.session.nets[net].net_class == "none", net
+
+
+def test_load_time_auto_classify_never_overrides_the_input_files_own_markers(
+    qapp: QApplication, make_window, tmp_path: Path
+) -> None:
+    """`.NetList` classification preloads first; the name pass only fills gaps."""
+    window = make_window()
+    spd = tmp_path / "mini.spd"
+    build_mini_spd(spd, style="si")  # POWER_NET_A/B + GROUND_NET already classified
+    _load_via_thread(qapp, window, spd)
+
+    source_col = window.net_tab.model.column_index("source")
+
+    def source_of(net: str) -> str:
+        model = window.net_tab.model
+        return model.cell_text(model.index(_net_row(model, net), source_col))
+
+    assert source_of(POWER_NET_A) == "input"
+    assert source_of(GROUND_NET) == "input"
+    assert source_of(UNCLASSIFIED_NETS[0]) == ""
+    # nothing was left for the name pass, so the status line drops the tally
+    counts = window.session.counts()
+    assert window.status_label.text() == f"Loaded: {counts['nets']} nets"
+
+
+def test_source_column_reports_auto_then_user_after_a_hand_classification(
+    qapp: QApplication, make_window, tmp_path: Path
+) -> None:
+    window = make_window()
+    spd = tmp_path / "unclassified.spd"
+    build_mini_spd(spd, style="si", classified=False)
+    _load_via_thread(qapp, window, spd)
+    model = window.net_tab.model
+    source_col = model.column_index("source")
+
+    def source_of(net: str) -> str:
+        return model.cell_text(model.index(_net_row(model, net), source_col))
+
+    assert source_of(POWER_NET_A) == "auto"  # the load-time name pass did it
+
+    row = window.net_tab.proxy.mapFromSource(model.index(_net_row(model, POWER_NET_A), 0))
+    window.net_tab.view.selectRow(row.row())
+    window.net_tab.classify_selection("ground")
+    assert source_of(POWER_NET_A) == "user"
+    assert _net_class(model, POWER_NET_A) == "ground"
+
+    # Undo puts the *class* back by replaying the same user-facing setter, so
+    # the origin stays "user": the column records who last decided this net's
+    # class, and after a Ctrl+Z on a hand classification that is still the user.
+    window.undo_stack.undo()
+    assert _net_class(model, POWER_NET_A) == "power"
+    assert source_of(POWER_NET_A) == "user"
+
+    assert model.headerData(
+        source_col, Qt.Orientation.Horizontal, Qt.ItemDataRole.ToolTipRole
+    ) == "Where this net's class came from"
+
+
+def test_paired_gnd_editor_offers_a_net_classified_ground_from_the_context_menu(
+    qapp: QApplication, make_window, tmp_path: Path
+) -> None:
+    """v0.1.2 bug fix, end to end: classify X as ground, open the editor, X is there."""
+    window = make_window()
+    spd = tmp_path / "unclassified.spd"
+    build_mini_spd(spd, style="si", classified=False)
+    _load_via_thread(qapp, window, spd)
+    tab = window.net_tab
+    model = tab.model
+    gnd_col = model.column_index("paired_gnd")
+
+    def combo_items(net: str) -> list[str]:
+        index = tab.proxy.mapFromSource(model.index(_net_row(model, net), gnd_col))
+        delegate = tab.view.itemDelegateForColumn(gnd_col)
+        editor = delegate.createEditor(tab.view.viewport(), QStyleOptionViewItem(), index)
+        return [editor.itemText(i) for i in range(editor.count())]
+
+    assert model.is_editable(model.index(_net_row(model, POWER_NET_A), gnd_col))
+    assert combo_items(POWER_NET_A) == ["", GROUND_NET]
+    assert UNCLASSIFIED_NETS[0] not in combo_items(POWER_NET_A)
+
+    row = tab.proxy.mapFromSource(model.index(_net_row(model, UNCLASSIFIED_NETS[0]), 0))
+    tab.view.selectRow(row.row())
+    assert tab.classify_selection("ground") == 1
+
+    assert UNCLASSIFIED_NETS[0] in combo_items(POWER_NET_A)
+
+
+def test_check_all_shown_from_the_net_table_context_menu(
+    qapp: QApplication, make_window, tmp_path: Path
+) -> None:
+    window = make_window()
+    spd = tmp_path / "mini.spd"
+    build_mini_spd(spd, style="si")
+    _load_via_thread(qapp, window, spd)
+    tab = window.net_tab
+
+    assert "Check all (shown)" in _menu_titles(tab.view)
+    assert "Uncheck all (shown)" in _menu_titles(tab.view)
+    assert "Check selected" in _menu_titles(tab.view)  # the per-selection pair stays
+
+    tab.filter_edit.setText("_gs")
+    assert tab.proxy.shownCount() == 2
+    tab.view.clearSelection()
+
+    before = window.undo_stack.count()
+    _menu_action(tab.view, "Uncheck all (shown)").trigger()
+
+    assert [window.session.nets[net].selected for net in (SENSE_NETS[1], SENSE_NETS[3])] == [
+        False,
+        False,
+    ]
+    assert window.session.nets[POWER_NET_A].selected is True  # filtered out -> untouched
+    assert window.undo_stack.count() == before + 1  # ONE undoable command
+    assert window.status_label.text() == "Unchecked 2 shown rows."
+
+    window.undo_stack.undo()
+    assert window.session.nets[SENSE_NETS[1]].selected is True
+
+
+def test_sorting_is_enabled_on_all_three_tables_and_survives_a_rescan(
+    qapp: QApplication, make_window, tmp_path: Path
+) -> None:
+    window = make_window()
+    spd = tmp_path / "mini.spd"
+    build_mini_spd(spd, style="si")
+    _load_via_thread(qapp, window, spd)
+
+    for tab in (window.net_tab, window.vrm_tab, window.sink_tab):
+        assert tab.view.isSortingEnabled()
+        assert tab.view.horizontalHeader().isSortIndicatorShown()
+        assert tab.view.model() is tab.proxy
+        assert tab.proxy.sourceModel() is tab.model
+
+    voltage_col = window.net_tab.model.column_index("voltage")
+    window.net_tab.view.sortByColumn(voltage_col, Qt.SortOrder.DescendingOrder)
+    proxy = window.net_tab.proxy
+    voltages = [proxy.index(r, voltage_col).data(SORT_ROLE) for r in range(proxy.rowCount())]
+    assert voltages == sorted(voltages, reverse=True)
+
+    # a rescan resets the models; the view must still be sorting
+    window._rescan()
+    _spin_until(qapp, lambda: not window._busy, 10.0, "rescan")
+    assert window.net_tab.view.isSortingEnabled()
+    assert window.net_tab.proxy.rowCount() == window.net_tab.model.rowCount()
 
 
 # --------------------------------------------------------------------------- #

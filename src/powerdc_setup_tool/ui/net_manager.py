@@ -68,7 +68,10 @@ class NetManagerTab(QWidget):
 
         self.view = BulkEditTableView(self)
         self.view.setModel(self.proxy)
+        self.view.enable_header_sorting()  # v0.1.2 click-to-sort
         self.view.setExtraMenuBuilder(self._build_extra_menu)
+        # v0.1.2 "Check/Uncheck all (shown)" reports its row count this way.
+        self.view.statusMessage.connect(self.statusMessage)
 
         self.filter_edit = QLineEdit()
         self.filter_edit.setPlaceholderText("Filter nets… (space = AND, * = glob)")

@@ -16,6 +16,12 @@ from under it. Errors surfaced from a worker use ``QMessageBox.open()``
 (non-blocking), not ``exec()``, since the calling slot runs off a worker
 signal and a nested modal event loop there would freeze the app.
 
+v0.1.2 loads a file *classified*: `_on_scan_finished` runs the same
+name-based pass the *Auto-classify* toolbar action does (which stays, for
+re-runs) before the first model refresh, so a `.spd` PowerSI left unclassified
+opens with its power/ground classes, its VRM/Sink rows and a populated Paired
+GND combo already in place instead of 3712 blank rows.
+
 `closeEvent` never lets a running `QThread` be destroyed -- Qt aborts the
 process (``QThread: Destroyed while thread is still running`` -> ``SIGABRT``)
 when that happens. Both workers therefore own a `threading.Event` cancel hook
@@ -201,6 +207,11 @@ class MainWindow(QMainWindow):
         for tab in (self.net_tab, self.vrm_tab, self.sink_tab):
             tab.model.dataChanged.connect(self._on_model_changed)
             tab.model.modelReset.connect(self._on_model_changed)
+            # v0.1.2: the shared view reports its own context-menu operations
+            # ("Checked 37 shown rows."), on every tab. The Net Manager re-emits
+            # its view's signal, so connecting the view here would double it up.
+            if tab is not self.net_tab:
+                tab.view.statusMessage.connect(self.status_label.setText)
         # v0.1.1: the Net Manager's context-menu operations report through here
         # ("Classified 12 nets as PowerNets.").
         self.net_tab.statusMessage.connect(self.status_label.setText)
@@ -358,10 +369,30 @@ class MainWindow(QMainWindow):
             self.progress_bar.setValue(done)
 
     def _on_scan_finished(self, result: ScanResult) -> None:
+        """`Session.load` + the v0.1.2 automatic classification pass, then repaint.
+
+        A `.spd` PowerSI never classified used to open as 3712 unclassified
+        rows: no power nets, so no VRM/Sink rows, no ground nets, and a Paired
+        GND combo with nothing in it. The *Auto-classify* toolbar action already
+        did the right thing, so it simply runs once here as part of loading --
+        **before** the first `refresh_from_session`, so the tables are never
+        painted in the unclassified state at all.
+
+        Order matters and is the one `_auto_classify` uses: `load` preloads the
+        `.NetList`'s own `PowerNets`/`GroundNets` markers (§G.1) and
+        `auto_classify_by_name` only ever touches nets still left at
+        ``"none"``, so a file-provided classification is filled *around*, never
+        overwritten. Pairing stays at ``force=False`` for the same reason -- a
+        ground the input file already paired survives the load.
+        """
         self.spd_path = self._pending_spd_path
         self._pending_spd_path = None
         self.session.load(result)
-        self.session.autopair()
+        before = self.session.counts()
+        self.session.auto_classify_by_name()
+        self.session.autopair(force=False)
+        self.session.derive_all()
+        after = self.session.counts()
         # The stack's commands hold row/column keys into the *previous* session;
         # redoing one after a fresh scan would write a stale edit onto a net
         # that may not even exist any more (design §C: one shared stack).
@@ -370,8 +401,13 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(False)
         self._set_busy(False)
         self._update_status_counts()
-        name = self.spd_path.name if self.spd_path else ""
-        self.status_label.setText(f"Loaded {name} — {len(self.session.nets)} nets.")
+        self.status_label.setText(
+            _load_summary(
+                len(self.session.nets),
+                after["power"] - before["power"],
+                after["ground"] - before["ground"],
+            )
+        )
 
     def _on_scan_failed(self, message: str) -> None:
         # The scan never landed: leave spd_path untouched (a Rescan keeps
@@ -696,6 +732,23 @@ class _ExportOptionsDialog(QDialog):
 # --------------------------------------------------------------------------- #
 # Module-level helpers
 # --------------------------------------------------------------------------- #
+
+
+def _load_summary(nets: int, power: int, ground: int) -> str:
+    """Status-bar line after a scan (v0.1.2).
+
+    ``"Loaded: 3712 nets · auto-classified +92 power +1 ground"``. The
+    auto-classify clause is dropped entirely when the pass moved nothing --
+    which is the normal case for an already-classified input file, where
+    reporting ``+0 power`` would read like something went wrong.
+    """
+    text = f"Loaded: {nets} net{'' if nets == 1 else 's'}"
+    parts = [
+        f"+{count} {label}" for count, label in ((power, "power"), (ground, "ground")) if count > 0
+    ]
+    if parts:
+        text += " · auto-classified " + " ".join(parts)
+    return text
 
 
 def _format_issues(issues: Iterable[ValidationIssue]) -> str:

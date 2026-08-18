@@ -7,6 +7,31 @@ Sigrity PowerSI `.spd` design for PowerDC (DCR) analysis: classify nets, pair po
 return (ground) nets, set per-net voltages, and generate the `.VRM` / `.Sink` blocks PowerDC
 expects -- then stream out a new `.spd` file, leaving the original untouched.
 
+## v0.1.2
+
+- **Column-header sorting on all three tables** -- click any header to sort ascending/descending,
+  with the usual indicator. Numeric columns (voltage, current, pins, die) sort *numerically*, not
+  as text, and sorting is purely view state: bulk edits, the context menu, checkbox toggles,
+  override styling, *Go to net* and undo/redo all keep addressing the rows you picked, whatever
+  order the table is in. Tables still open in the input file's own net order.
+- **Check all (shown) / Uncheck all (shown)** -- two new Net Manager context-menu entries that set
+  the *Use* checkbox for every row the filter is currently showing (not just the selected ones), as
+  a single undoable step with a status-bar count. *Check/Uncheck selected* is unchanged.
+- **Paired GND combo fix** -- the drop-down could come up empty, leaving nothing to pick. It is now
+  built from the session's ground nets *at the moment the editor opens*, always with a blank entry
+  (to clear the pairing) and the row's own current value, so a net just classified as ground is
+  offered immediately and the combo is never a dead end.
+- **Auto-classification on load** -- opening a `.spd` now runs the name-based classification and
+  ground pairing automatically, before the tables are first drawn, so an unclassified design shows
+  its power/ground classes, pairings and VRM/Sink rows right away. Classification the input file
+  already carries is still preloaded first and is never overridden. The *Auto-classify* toolbar
+  button stays, for re-runs. The status bar reports
+  `Loaded: N nets · auto-classified +P power +G ground`.
+- **Source column** -- now says where a net's class actually came from: `input` (the loaded
+  `.NetList` classified it), `auto` (the tool's own name-based/pairing pass did), `user` (you did),
+  or blank while the net is unclassified. It is saved in the config JSON, and configs written by
+  older versions still load.
+
 ## v0.1.1
 
 - **Right-click Classify** -- the Net Manager's context menu now opens with PowerSI's own
@@ -32,7 +57,8 @@ expects -- then stream out a new `.spd` file, leaving the original untouched.
 - **VRM and Sink generation** -- one `.VRM` / `.Sink` block per selected power net, with editable
   nominal voltage, sense voltage (VRM), and output/sink current per row.
 - **Multi-row / multi-cell bulk editing** on all three tables (Net Manager, VRMs, Sinks): type-to-fill
-  across a selection, fill down/right, TSV copy/paste, checkbox toggling, all undoable.
+  across a selection, fill down/right, TSV copy/paste, checkbox toggling, all undoable -- and
+  click-to-sort on every column header, with numeric columns sorted as numbers.
 - **Streaming, 1.4 GB-safe rewrite** -- input files around 1.4 GB (output around 1.6 GB) are scanned
   and rewritten with a single forward streaming pass and bounded memory use; the file is never
   loaded fully into RAM.

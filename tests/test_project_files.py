@@ -86,7 +86,7 @@ def test_iss_defines_app_metadata_and_fresh_appid() -> None:
     assert NEW_APP_APPID in iss
     # Must not reuse the old app's installer identity.
     assert OLD_APP_APPID not in iss
-    assert "MyAppVersion" in iss and '"0.1.1"' in iss
+    assert "MyAppVersion" in iss and '"0.1.2"' in iss
     assert "SPD Manipulator for PowerDC" in iss  # DefaultDirName / Files source
     assert "desktopicon" in iss
     assert "Compression=lzma" in iss
@@ -235,7 +235,7 @@ def test_pyproject_matches_package_name_script_and_version() -> None:
     project = pyproject["project"]
 
     assert project["name"] == "powerdc-setup-tool"
-    assert project["version"] == "0.1.1"
+    assert project["version"] == "0.1.2"
 
     scripts = project.get("scripts", {})
     assert scripts.get("powerdc-setup-tool") == "powerdc_setup_tool.app:main"
@@ -244,3 +244,32 @@ def test_pyproject_matches_package_name_script_and_version() -> None:
     match = re.search(r'__version__\s*=\s*"([^"]+)"', init_text)
     assert match is not None, "__version__ not found in __init__.py"
     assert match.group(1) == project["version"]
+
+
+def test_every_version_default_agrees_with_pyproject() -> None:
+    """All four places a release has to be bumped say the same thing.
+
+    `pyproject.toml` and `__init__.__version__` are the two the app itself
+    reads; the `.iss` `MyAppVersion` fallback and `build.ps1`'s `$Version`
+    default are what a build run *without* an explicit version produces, and a
+    stale one there ships an installer named after the previous release.
+    """
+    version = tomllib.loads(_read("pyproject.toml"))["project"]["version"]
+
+    iss = re.search(r'#define\s+MyAppVersion\s+"([^"]+)"', _read("packaging/powerdc-setup-tool.iss"))
+    assert iss is not None, "MyAppVersion not found in the .iss"
+    assert iss.group(1) == version
+
+    build = re.search(r'\$Version\s*=\s*"([^"]+)"', _read("scripts/build.ps1"))
+    assert build is not None, "$Version default not found in build.ps1"
+    assert build.group(1) == version
+
+
+def test_readme_carries_the_current_version_changelog() -> None:
+    version = tomllib.loads(_read("pyproject.toml"))["project"]["version"]
+    readme = _read("README.md")
+
+    assert f"## v{version}" in readme
+    # v0.1.2's five headline items.
+    for phrase in ("sort", "Check all", "Paired GND", "Auto-classif", "Source"):
+        assert phrase in readme, phrase

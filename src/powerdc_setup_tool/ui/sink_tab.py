@@ -4,6 +4,10 @@ Columns: Use | Net | Component | Ground | Nominal V | Current (A) | Model |
 PFMode | PinEqualCurrent | Pos pins | Neg pins | Name. Model/PFMode/
 PinEqualCurrent are advanced spin cells hidden behind a "Show advanced"
 checkbox (defaults 2/2/1, spec §A3).
+
+v0.1.2 puts a `ConfigSortProxy` between the model and the view for header
+sorting; the proxy never reorders *columns*, so `ADVANCED_COLUMNS` still
+addresses the right three.
 """
 
 from __future__ import annotations
@@ -11,7 +15,7 @@ from __future__ import annotations
 from PySide6.QtWidgets import QCheckBox, QHBoxLayout, QPushButton, QVBoxLayout, QWidget
 
 from powerdc_setup_tool.core.session import Session
-from powerdc_setup_tool.ui.models import SinkTableModel
+from powerdc_setup_tool.ui.models import ConfigSortProxy, SinkTableModel, source_index
 from powerdc_setup_tool.ui.table_view import BulkEditTableView
 
 __all__ = ["SinkTab"]
@@ -24,8 +28,11 @@ class SinkTab(QWidget):
         super().__init__(parent)
         self.session = session
         self.model = SinkTableModel(session)
+        self.proxy = ConfigSortProxy(self)
+        self.proxy.setSourceModel(self.model)
         self.view = BulkEditTableView(self)
-        self.view.setModel(self.model)
+        self.view.setModel(self.proxy)
+        self.view.enable_header_sorting()  # v0.1.2
 
         self.add_button = QPushButton("Add Sink row")
         self.add_button.setToolTip("Add a second/third .Sink row for the current net")
@@ -78,12 +85,16 @@ class SinkTab(QWidget):
 
 
 def _selected_row_keys(view: BulkEditTableView, model: SinkTableModel) -> list[str]:
-    """Stable `Session` row keys for every row touched by *view*'s selection."""
+    """Stable `Session` row keys for every row touched by *view*'s selection.
+
+    Mapped down through the v0.1.2 sort proxy -- a view row is a sorted
+    position, not a model row (see `ui/vrm_tab.py`).
+    """
     selection = view.selectionModel()
     indexes = selection.selectedIndexes() if selection is not None else []
-    rows = sorted({index.row() for index in indexes if index.isValid()})
+    rows = sorted({source_index(index).row() for index in indexes if index.isValid()})
     if not rows:
         current = view.currentIndex()
         if current.isValid():
-            rows = [current.row()]
+            rows = [source_index(current).row()]
     return [key for row in rows if (key := model.row_key(row))]

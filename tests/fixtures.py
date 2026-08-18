@@ -326,7 +326,7 @@ def _autoclassify_section() -> str:
     )
 
 
-def _netlist_entries() -> list[str]:
+def _netlist_entries(classified: bool = True) -> list[str]:
     """The `.NetList` body: BFS-serialized 2-level tree (spec §2).
 
     L1 root + L1 plain/group entries (ASCII-sorted, group nodes included in
@@ -334,16 +334,32 @@ def _netlist_entries() -> list[str]:
     child only) + trailing out-of-order L1 sense nets. Per spec §2 ("The 92
     power members carry no Voltage ="), only the ground member gets
     `Voltage = 0`; power members do not.
+
+    ``classified=False`` is the *un*classified design: the `PowerNets` and
+    `GroundNets` group nodes are still there (PowerSI always writes them), but
+    no net is a member of either -- every real net is a plain L1 entry carrying
+    `::Unselected||DropShape`, which per spec §2 both marks it unclassified and
+    terminates any enclosing member run. That is the state a design PowerSI
+    never classified arrives in, and what v0.1.2's load-time auto-classify
+    exists for.
     """
+    if classified:
+        power_a = f"\t{POWER_NET_A} -> PowerNets Color = RED"
+        power_b = f"\t{POWER_NET_B} Color = OLIVE"  # inherits PowerNets (no `->`)
+        ground = f"\t{GROUND_NET} -> GroundNets Color = GREEN Voltage = 0"
+    else:
+        power_a = f"\t{POWER_NET_A}::Unselected||DropShape Color = RED"
+        power_b = f"\t{POWER_NET_B}::Unselected||DropShape Color = OLIVE"
+        ground = f"\t{GROUND_NET}::Unselected||DropShape Color = GREEN"
     return [
         "\t::Unselected||DropShape RiseTime = 0ps %Coupling = 0",
         "\tGroundNets Color = LIME",
         "\tPowerNets Color = RED",
         f"\t{UNCLASSIFIED_NETS[0]}::Unselected||DropShape Color = GREEN",
         f"\t{UNCLASSIFIED_NETS[1]}::Unselected||DropShape Color = YELLOW",
-        f"\t{GROUND_NET} -> GroundNets Color = GREEN Voltage = 0",
-        f"\t{POWER_NET_A} -> PowerNets Color = RED",
-        f"\t{POWER_NET_B} Color = OLIVE",
+        ground,
+        power_a,
+        power_b,
         f"\t{SENSE_NETS[0]}::Unselected||DropShape Color = DARKCYAN",
         f"\t{SENSE_NETS[1]}::Unselected||DropShape Color = DARKBLUE",
         f"\t{SENSE_NETS[2]}::Unselected||DropShape Color = BLUE",
@@ -351,8 +367,8 @@ def _netlist_entries() -> list[str]:
     ]
 
 
-def _netlist_section() -> str:
-    lines = [".NetList", *_netlist_entries(), ".EndNetList"]
+def _netlist_section(classified: bool = True) -> str:
+    lines = [".NetList", *_netlist_entries(classified), ".EndNetList"]
     return "\n".join(lines) + "\n"
 
 
@@ -368,7 +384,7 @@ def _tail() -> str:
     return "* Design rules/Clearances description lines\n.End\n"
 
 
-def _render(style: Style) -> str:
+def _render(style: Style, classified: bool = True) -> str:
     sections = [
         _title_line(style),
         "* Geometry description lines\n",
@@ -380,7 +396,7 @@ def _render(style: Style) -> str:
         _powersi_section(),
         _powerdc_section(style),
         _autoclassify_section(),
-        _netlist_section(),
+        _netlist_section(classified),
         _netalias_section(),
         _tail(),
     ]
@@ -392,6 +408,7 @@ def build_mini_spd(
     *,
     style: Style = "si",
     newline: Newline = "lf",
+    classified: bool = True,
     **opts: object,
 ) -> None:
     """Write a complete miniature `.spd` file to *path* exercising the real
@@ -401,17 +418,23 @@ def build_mini_spd(
     emits them plus the patched `WorkflowKey`. ``newline="crlf"`` emits CRLF
     throughout (a single global substitution applied after assembly, so every
     line ending -- including inside otherwise-"copied" regions -- flips
-    consistently). ``**opts`` is accepted and currently ignored: reserved so
-    future chunks (e.g. `test_perf`'s larger synthetic files) can extend this
-    signature without breaking callers of the fixed-size miniature shape.
+    consistently). ``classified=False`` writes the same design with an
+    *unclassified* `.NetList` -- no net in `PowerNets`/`GroundNets` -- which is
+    what a design PowerSI never classified looks like (see `_netlist_entries`);
+    it only makes sense with ``style="si"``. ``**opts`` is accepted and
+    currently ignored: reserved so future chunks (e.g. `test_perf`'s larger
+    synthetic files) can extend this signature without breaking callers of the
+    fixed-size miniature shape.
     """
     if style not in ("si", "dc"):
         raise ValueError(f"style must be 'si' or 'dc', got {style!r}")
     if newline not in ("lf", "crlf"):
         raise ValueError(f"newline must be 'lf' or 'crlf', got {newline!r}")
+    if style == "dc" and not classified:
+        raise ValueError("classified=False only makes sense with style='si'")
     del opts
 
-    content = _render(style)
+    content = _render(style, classified)
     if newline == "crlf":
         content = content.replace("\n", "\r\n")
     Path(path).write_bytes(content.encode("utf-8"))

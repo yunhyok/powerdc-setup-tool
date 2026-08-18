@@ -3,6 +3,11 @@
 Columns: Use | Net | Component | Ground | Nominal V | Sense V | Output
 Current (A) | Pos pins | Neg pins | Name (derived read-only,
 `VRM_{comp}_{pnet}_{gnet}`).
+
+v0.1.2 puts a `ConfigSortProxy` between the model and the view so the header
+sorts here as it does on the Net Manager; `self.model` is still the
+`VrmTableModel` and `self.view.model()` is the proxy, so anything reading a
+selection has to map through `source_index` first.
 """
 
 from __future__ import annotations
@@ -10,7 +15,7 @@ from __future__ import annotations
 from PySide6.QtWidgets import QHBoxLayout, QPushButton, QVBoxLayout, QWidget
 
 from powerdc_setup_tool.core.session import Session
-from powerdc_setup_tool.ui.models import VrmTableModel
+from powerdc_setup_tool.ui.models import ConfigSortProxy, VrmTableModel, source_index
 from powerdc_setup_tool.ui.table_view import BulkEditTableView
 
 __all__ = ["VrmTab"]
@@ -23,8 +28,11 @@ class VrmTab(QWidget):
         super().__init__(parent)
         self.session = session
         self.model = VrmTableModel(session)
+        self.proxy = ConfigSortProxy(self)
+        self.proxy.setSourceModel(self.model)
         self.view = BulkEditTableView(self)
-        self.view.setModel(self.model)
+        self.view.setModel(self.proxy)
+        self.view.enable_header_sorting()  # v0.1.2
 
         self.add_button = QPushButton("Add VRM row")
         self.add_button.setToolTip("Add a second/third .VRM row for the current net")
@@ -65,12 +73,17 @@ class VrmTab(QWidget):
 
 
 def _selected_row_keys(view: BulkEditTableView, model: VrmTableModel) -> list[str]:
-    """Stable `Session` row keys for every row touched by *view*'s selection."""
+    """Stable `Session` row keys for every row touched by *view*'s selection.
+
+    Mapped down through the v0.1.2 sort proxy: a view row is a *sorted*
+    position, so taking it as a model row would remove the wrong `.VRM` rows
+    the moment the user sorts by anything.
+    """
     selection = view.selectionModel()
     indexes = selection.selectedIndexes() if selection is not None else []
-    rows = sorted({index.row() for index in indexes if index.isValid()})
+    rows = sorted({source_index(index).row() for index in indexes if index.isValid()})
     if not rows:
         current = view.currentIndex()
         if current.isValid():
-            rows = [current.row()]
+            rows = [source_index(current).row()]
     return [key for row in rows if (key := model.row_key(row))]
