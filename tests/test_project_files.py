@@ -86,7 +86,7 @@ def test_iss_defines_app_metadata_and_fresh_appid() -> None:
     assert NEW_APP_APPID in iss
     # Must not reuse the old app's installer identity.
     assert OLD_APP_APPID not in iss
-    assert "MyAppVersion" in iss and '"0.1.0"' in iss
+    assert "MyAppVersion" in iss and '"0.1.1"' in iss
     assert "SPD Manipulator for PowerDC" in iss  # DefaultDirName / Files source
     assert "desktopicon" in iss
     assert "Compression=lzma" in iss
@@ -235,7 +235,7 @@ def test_pyproject_matches_package_name_script_and_version() -> None:
     project = pyproject["project"]
 
     assert project["name"] == "powerdc-setup-tool"
-    assert project["version"] == "0.1.0"
+    assert project["version"] == "0.1.1"
 
     scripts = project.get("scripts", {})
     assert scripts.get("powerdc-setup-tool") == "powerdc_setup_tool.app:main"

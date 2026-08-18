@@ -794,6 +794,30 @@ def test_context_menu_offers_every_design_entry(session: Session) -> None:
     ]
 
 
+def test_extra_menu_builder_prepends_tab_entries(session: Session) -> None:
+    """v0.1.1 hook: the Net Manager's *Classify* submenu without a per-tab branch."""
+    view = view_for(VrmTableModel(session))
+    shared = [action.text() for action in view.build_context_menu().actions() if action.text()]
+
+    built: list[object] = []
+
+    def builder(menu) -> None:
+        built.append(menu)
+        menu.addAction("Tab entry")
+
+    view.setExtraMenuBuilder(builder)
+    assert view.extraMenuBuilder() is builder
+    actions = view.build_context_menu().actions()
+    assert [action.text() for action in actions if action.text()] == ["Tab entry", *shared]
+    assert actions[1].isSeparator()  # injected entries are fenced off from the shared ones
+    assert len(built) == 1
+
+    view.setExtraMenuBuilder(None)
+    assert [
+        action.text() for action in view.build_context_menu().actions() if action.text()
+    ] == shared
+
+
 def test_context_menu_operations(session: Session) -> None:
     model = NetTableModel(session)
     view = view_for(model)

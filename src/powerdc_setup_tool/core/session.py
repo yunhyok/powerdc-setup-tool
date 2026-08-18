@@ -71,6 +71,11 @@ Deliberate deviations / resolutions (call sites in `tests/test_session.py`)
   ``SITE{die}`` without the net does not win.
 * `autopair()`/`derive_all()` return their `ChangedKey` lists (the chunk-0 stub
   typed both as ``None``); `to_json` takes an `indent` keyword.
+* **Name-based classification (v0.1.1).** The `.NetList` already carries the
+  classification markers PowerSI wrote (§G.1), so `auto_classify_by_name` only
+  fills the gaps: it looks at nets whose class is still ``"none"`` and never at
+  an already-classified one, `from_input` or not. `classify_net_name` is the
+  name-only rule behind it (`AUTO_GROUND_NAME_RE`/`AUTO_POWER_NAME_RE`).
 * **Structural bookkeeping (chunk 7).** `_ensure_ground` can materialize a
   brand-new Net Manager row (a ground net that the `.NetList` never mentioned),
   so it bumps `structure_version` like every other row-adding mutator;
@@ -105,10 +110,14 @@ from powerdc_setup_tool.core.writer import WritePlan
 __all__ = [
     "ChangedKey",
     "Session",
+    "classify_net_name",
     "net_key",
     "vrm_key",
     "sink_key",
     "split_key",
+    "AUTO_CONTROL_NAME_RE",
+    "AUTO_GROUND_NAME_RE",
+    "AUTO_POWER_NAME_RE",
     "CONFIG_VERSION",
     "DEFAULT_VOLTAGE",
     "DEFAULT_CURRENT",
@@ -136,6 +145,35 @@ GROUND_NAME_RE = re.compile(r"^(?:D?GND|VSS|GROUND)", re.IGNORECASE)
 
 #: design §G.4: `_PS`/`_GS` remote-sense nets are netlist-only and carry no pins.
 SENSE_NET_RE = re.compile(r"_(?:PS|GS)(?:/\d+)?$", re.IGNORECASE)
+
+#: v0.1.1 name-based classification (`auto_classify_by_name`): a **whole** base
+#: name (die suffix stripped) that reads as a return net -- `GND`, `AGND2`,
+#: `DGND_A`, `VSS`, `DDR_VSSA`, `GROUND`. Deliberately whole-name: a rail called
+#: `ADC_VDD_070_GND_REF` is a power net whose name merely mentions a ground.
+AUTO_GROUND_NAME_RE = re.compile(r"^(?:A?D?GND[A-Za-z0-9_]*|.*VSS.*|GROUND)$", re.IGNORECASE)
+
+#: v0.1.1 name-based classification: an ``_``-delimited token that *starts* with
+#: one of the usual rail spellings (an alphanumeric tail is part of the token,
+#: so `VDD` also covers `VDDQ`/`VDDA`/`VDD2`). The real design's power nets are
+#: `ADC_VDD_070_VP_HSIO/0` -- matched on the `VDD` token -- while its signal
+#: nets (`W_DDR9_BP_C0_DQ[8]/1`, `AONI_GPIO[3]/0`) carry no such token.
+AUTO_POWER_NAME_RE = re.compile(
+    r"(?:^|[^A-Za-z0-9])"
+    r"(?:[AD]?VDD|[AD]?VCC|VPP|VBAT|VREG|VAA|VINT|VSYS|PWR)"
+    r"[A-Za-z0-9]*",
+    re.IGNORECASE,
+)
+
+#: v0.1.1 name-based classification: a rail token does **not** make a power net
+#: when the name ends in a control/status marker -- `PWR_GOOD`, `VDD_EN` and
+#: `VDDQ_PGOOD` are signals that talk *about* a rail, not the rail itself. No
+#: real rail on the design ends this way, so this only ever removes false hits.
+AUTO_CONTROL_NAME_RE = re.compile(
+    r"_(?:EN|ENABLE|OK|GOOD|PG|PGOOD|GD|RST|RESET|FLT|FAULT)$", re.IGNORECASE
+)
+
+#: spec §4 die suffix, stripped before a name is classified.
+_DIE_SUFFIX_RE = re.compile(r"/\d+$")
 
 #: design §G.3: the die-side circuits, excluded from the VRM-component pool.
 _SITE_PREFIX = "SITE"
@@ -265,6 +303,30 @@ def split_key(row_key: str) -> tuple[str, str, int]:
 # --------------------------------------------------------------------------- #
 # Small helpers
 # --------------------------------------------------------------------------- #
+
+
+def classify_net_name(net: str) -> str | None:
+    """``"ground"`` / ``"power"`` / ``None`` from *net*'s name alone (v0.1.1).
+
+    The name-only half of `Session.auto_classify_by_name`: the die suffix is
+    stripped, `AUTO_GROUND_NAME_RE` is tried first (a whole-name match), then
+    `AUTO_POWER_NAME_RE` (a rail token anywhere in the name, unless
+    `AUTO_CONTROL_NAME_RE` marks the name as a rail *status* signal). ``None``
+    means "no confident guess" -- signal nets and, deliberately, the `_PS`/`_GS`
+    remote-sense nets, which design §G.4 wants left unclassified even though
+    they are spelled like the rail they sense.
+    """
+    name = str(net or "")
+    if not name or SENSE_NET_RE.search(name):
+        return None
+    base = _DIE_SUFFIX_RE.sub("", name)
+    if not base:
+        return None
+    if AUTO_GROUND_NAME_RE.match(base):
+        return CLASS_GROUND
+    if AUTO_POWER_NAME_RE.search(base) and not AUTO_CONTROL_NAME_RE.search(base):
+        return CLASS_POWER
+    return None
 
 
 def _is_site(circuit: str) -> bool:
@@ -822,6 +884,36 @@ class Session:
         if self.scan is None and not self.nets:
             return []
         before = self._snapshot()
+        self._sync_rows()
+        self._propagate()
+        return self._diff(before)
+
+    def auto_classify_by_name(self) -> list[ChangedKey]:
+        """Classify the still-unclassified nets from their names (v0.1.1).
+
+        Only nets whose `net_class` is ``"none"`` are touched: the `.NetList`'s
+        own `PowerNets`/`GroundNets` membership (§G.1, ``from_input``) and every
+        hand-made choice are markers this must never second-guess -- it only
+        fills the gaps PowerSI left. `classify_net_name` decides per name, so
+        `_PS`/`_GS` sense nets stay unclassified (§G.4).
+
+        Newly classified rows then go through the normal derive path
+        (`_sync_rows`/`_propagate`), which is what gives a new power net its
+        name-guessed voltage, a default paired ground and its VRM/Sink rows.
+        """
+        before = self._snapshot()
+        for net in self._ordered_nets():
+            cfg = self.nets[net]
+            if cfg.net_class != CLASS_NONE:
+                continue
+            guess = classify_net_name(net)
+            if guess is None:
+                continue
+            cfg.net_class = guess
+            if guess != CLASS_POWER:
+                cfg.paired_gnd = ""  # same invariant `set_class` keeps
+            if not cfg.voltage_override:
+                cfg.voltage = self._auto_net_voltage(cfg)
         self._sync_rows()
         self._propagate()
         return self._diff(before)

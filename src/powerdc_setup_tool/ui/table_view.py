@@ -6,6 +6,10 @@ row-select via vertical header): type-to-fill, fill-down/right (Ctrl+D/R),
 TSV copy/paste (Ctrl+C/V), space-toggle, context menu, one `BulkEditCommand`
 on the undo stack per operation.
 
+The context menu takes an injectable per-tab prefix (`setExtraMenuBuilder`):
+v0.1.1's *Classify* submenu belongs to the Net Manager alone, and the VRM/Sink
+tabs share this class, so the owning tab supplies those entries.
+
 Undo fidelity
 -------------
 A `Session` cell is either *auto-derived* or *user-set* (design §B), so
@@ -24,7 +28,7 @@ the way in (`note_pending_edit`), which is the only pre-commit hook Qt gives us.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -208,6 +212,7 @@ class BulkEditTableView(QTableView):
         self._auto_delegates = True
         self._delegates: list[Any] = []
         self._delegate_columns: list[int] = []
+        self._extra_menu_builder: Callable[[QMenu], None] | None = None
 
     # ------------------------------------------------------------------ #
     # Wiring
@@ -239,6 +244,21 @@ class BulkEditTableView(QTableView):
             self._undo_stack.clear()
         if self._auto_delegates:
             self.install_default_delegates()
+
+    def setExtraMenuBuilder(self, builder: Callable[[QMenu], None] | None) -> None:
+        """Install a hook that prepends tab-specific entries to the context menu.
+
+        This view is shared by all three tabs, but only the Net Manager gets the
+        v0.1.1 *Classify* submenu (PowerSI's own right-click wording), so the
+        owning tab injects its entries instead of `build_context_menu` growing a
+        per-tab special case. The builder is called with the fresh `QMenu`
+        *before* the shared entries, and a separator is added after it if it
+        contributed anything.
+        """
+        self._extra_menu_builder = builder
+
+    def extraMenuBuilder(self) -> Callable[[QMenu], None] | None:
+        return self._extra_menu_builder
 
     def setAutoDelegates(self, enabled: bool) -> None:
         """Disable before `setModel` when chunk 5 wants to install its own set."""
@@ -752,8 +772,16 @@ class BulkEditTableView(QTableView):
         return True
 
     def build_context_menu(self) -> QMenu:
-        """design §C context menu (built separately so it stays testable)."""
+        """design §C context menu (built separately so it stays testable).
+
+        A `setExtraMenuBuilder` hook -- the Net Manager's *Classify* submenu --
+        goes in first, so tab-specific entries sit at the top of the menu.
+        """
         menu = QMenu(self)
+        if self._extra_menu_builder is not None:
+            self._extra_menu_builder(menu)
+            if not menu.isEmpty():
+                menu.addSeparator()
         entries: tuple[tuple[str, Any], ...] = (
             ("Set value…", self._prompt_set_value),
             ("Fill Down", self._fill_down),

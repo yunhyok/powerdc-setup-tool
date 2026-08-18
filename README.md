@@ -7,6 +7,19 @@ Sigrity PowerSI `.spd` design for PowerDC (DCR) analysis: classify nets, pair po
 return (ground) nets, set per-net voltages, and generate the `.VRM` / `.Sink` blocks PowerDC
 expects -- then stream out a new `.spd` file, leaving the original untouched.
 
+## v0.1.1
+
+- **Right-click Classify** -- the Net Manager's context menu now opens with PowerSI's own
+  *Classify > as PowerNets / as GroundNets / as Signal Nets*, applied to the whole selection as a
+  single undoable step. The separate Mark Power / Mark Ground / Clear class button row is gone
+  (*Set voltage…* and *Set paired ground…* live in the same menu).
+- **Name-based auto-classification** -- *Auto-classify* now also classifies the nets the input file
+  left unclassified from their names (`..._VDD_...`/`VCC`/`VPP`/... -> power, `GND`/`AGND`/`VSS`/
+  `GROUND` -> ground), leaving signal nets, `_PS`/`_GS` sense nets, rail status signals
+  (`PWR_GOOD`, `VDD_EN`) and every net the `.NetList` already classified untouched, then re-runs
+  ground pairing. New power nets pick up their name-derived voltage, default ground pairing and
+  VRM/Sink rows exactly as a manual classification would.
+
 ## What it does
 
 - **Net selection & classification** -- Power / Ground / Unclassified, in a filterable table that

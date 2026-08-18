@@ -136,7 +136,9 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.rescan_action)
 
         self.auto_classify_action = QAction("Auto-classify", self)
-        self.auto_classify_action.setToolTip("Re-run automatic ground pairing for every power net")
+        self.auto_classify_action.setToolTip(
+            "Classify unclassified nets by name and re-run ground pairing"
+        )
         self.auto_classify_action.triggered.connect(self._auto_classify)
         toolbar.addAction(self.auto_classify_action)
 
@@ -199,6 +201,9 @@ class MainWindow(QMainWindow):
         for tab in (self.net_tab, self.vrm_tab, self.sink_tab):
             tab.model.dataChanged.connect(self._on_model_changed)
             tab.model.modelReset.connect(self._on_model_changed)
+        # v0.1.1: the Net Manager's context-menu operations report through here
+        # ("Classified 12 nets as PowerNets.").
+        self.net_tab.statusMessage.connect(self.status_label.setText)
         self.undo_stack.indexChanged.connect(self._on_model_changed)
 
     def _on_model_changed(self, *_args: object) -> None:
@@ -385,15 +390,28 @@ class MainWindow(QMainWindow):
         self._show_error("Open SPD", message)
 
     def _auto_classify(self) -> None:
+        """Name-based classification of what is still unclassified, then pairing.
+
+        The `.NetList`'s own `PowerNets`/`GroundNets` markers are honoured by
+        `Session.load`, so this only fills the gaps (v0.1.1) before re-running
+        the design §C ground pairing over every power net.
+        """
         if self._busy:
             return
         if self.session.scan is None:
             QMessageBox.information(self, APP_TITLE, "Open a .spd file first.")
             return
+        before = self.session.counts()
+        self.session.auto_classify_by_name()
         self.session.autopair(force=True)
+        self.session.derive_all()
         self._refresh_all_models()
         self._update_status_counts()
-        self.status_label.setText("Auto-classification re-applied.")
+        after = self.session.counts()
+        self.status_label.setText(
+            f"Auto-classify: +{after['power'] - before['power']} power, "
+            f"+{after['ground'] - before['ground']} ground"
+        )
 
     def _refresh_all_models(self) -> None:
         for tab in (self.net_tab, self.vrm_tab, self.sink_tab):

@@ -32,12 +32,20 @@ from pathlib import Path  # noqa: E402
 
 import pytest  # noqa: E402
 from PySide6.QtGui import QUndoStack  # noqa: E402
-from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMessageBox  # noqa: E402
+from PySide6.QtWidgets import (  # noqa: E402
+    QApplication,
+    QDialog,
+    QFileDialog,
+    QInputDialog,
+    QMessageBox,
+)
 
 from fixtures import (  # noqa: E402
     GROUND_NET,
     POWER_NET_A,
     POWER_NET_B,
+    SENSE_NETS,
+    UNCLASSIFIED_NETS,
     build_mini_spd,
     expected_dc,
 )
@@ -549,11 +557,36 @@ def test_save_and_load_config_round_trips_through_models(
 
 
 # --------------------------------------------------------------------------- #
-# Net Manager toolbar buttons (Mark Power / Mark Ground / Clear class / ...)
+# Net Manager context menu: Classify (v0.1.1, PowerSI's own right-click wording)
 # --------------------------------------------------------------------------- #
 
 
-def test_net_manager_mark_power_and_ground_buttons(
+def _net_row(model, net: str) -> int:
+    return next(r for r in range(model.rowCount()) if model.net_for_row(r) == net)
+
+
+def _net_class(model, net: str) -> str:
+    return model.data(model.index(_net_row(model, net), model.column_index("net_class")))
+
+
+def _menu_titles(view) -> list[str]:
+    return [action.text() for action in view.build_context_menu().actions() if action.text()]
+
+
+def _menu_action(view, title: str):
+    """The context-menu entry titled *title* (top level or inside a submenu)."""
+    for action in view.build_context_menu().actions():
+        if action.text() == title:
+            return action
+        submenu = action.menu()
+        if submenu is not None:
+            for entry in submenu.actions():
+                if entry.text() == title:
+                    return entry
+    raise AssertionError(f"no context-menu entry {title!r} in {_menu_titles(view)}")
+
+
+def test_net_table_context_menu_leads_with_the_classify_submenu(
     qapp: QApplication, make_window, tmp_path: Path
 ) -> None:
     window = make_window()
@@ -561,20 +594,116 @@ def test_net_manager_mark_power_and_ground_buttons(
     build_mini_spd(spd, style="si")
     _load_via_thread(qapp, window, spd)
 
-    model = window.net_tab.model
-    view = window.net_tab.view
-    proxy = window.net_tab.proxy
-    row = next(r for r in range(model.rowCount()) if model.net_for_row(r) == GROUND_NET)
-    proxy_row = proxy.mapFromSource(model.index(row, 0)).row()
-    view.selectRow(proxy_row)
+    titles = _menu_titles(window.net_tab.view)
+    assert titles[:2] == ["Classify", "Set voltage…"]
+    assert titles[2] == "Set value…"  # the shared design §C entries follow
+    # the multi-row ground picker is a shared entry -- not duplicated, still there
+    assert "Set paired ground…" in titles
+
+    submenu = next(
+        action.menu()
+        for action in window.net_tab.view.build_context_menu().actions()
+        if action.text() == "Classify"
+    )
+    assert [action.text() for action in submenu.actions()] == [
+        "as PowerNets",
+        "as GroundNets",
+        "as Signal Nets",
+    ]
+
+    # the VRM/Sink tabs share `BulkEditTableView` and must NOT grow the submenu
+    for tab in (window.vrm_tab, window.sink_tab):
+        assert "Classify" not in _menu_titles(tab.view)
+        assert "Set voltage…" not in _menu_titles(tab.view)
+
+
+def test_classify_menu_applies_to_a_multi_row_proxy_selection_and_undoes_once(
+    qapp: QApplication, make_window, tmp_path: Path
+) -> None:
+    window = make_window()
+    spd = tmp_path / "mini.spd"
+    build_mini_spd(spd, style="si")
+    _load_via_thread(qapp, window, spd)
+    tab = window.net_tab
+    model = tab.model
+
+    # a filter shifts every visible row, so the menu has to map its selection
+    # back through `NetFilterProxy` to reach the right `Session` rows.
+    tab.filter_edit.setText("_gs")
+    nets = (SENSE_NETS[1], SENSE_NETS[3])
+    assert tab.proxy.shownCount() == 2
+    assert [_net_row(model, net) for net in nets] != [0, 1]
+    tab.view.selectAll()
 
     before = window.undo_stack.count()
-    window.net_tab._clear_class()
-    assert model.data(model.index(row, model.column_index("net_class"))) == "none"
+    _menu_action(tab.view, "as GroundNets").trigger()
+
+    assert [_net_class(model, net) for net in nets] == ["ground", "ground"]
+    assert window.undo_stack.count() == before + 1  # ONE command for both rows
+    assert window.status_label.text() == "Classified 2 nets as GroundNets."
+
+    window.undo_stack.undo()  # ...so one Ctrl+Z restores both
+    assert [_net_class(model, net) for net in nets] == ["none", "none"]
+
+
+def test_classify_as_signal_nets_clears_a_class_and_skips_no_op_rows(
+    qapp: QApplication, make_window, tmp_path: Path
+) -> None:
+    window = make_window()
+    spd = tmp_path / "mini.spd"
+    build_mini_spd(spd, style="si")
+    _load_via_thread(qapp, window, spd)
+    tab = window.net_tab
+    model = tab.model
+
+    proxy_row = tab.proxy.mapFromSource(model.index(_net_row(model, GROUND_NET), 0)).row()
+    tab.view.selectRow(proxy_row)
+
+    before = window.undo_stack.count()
+    _menu_action(tab.view, "as Signal Nets").trigger()
+    assert _net_class(model, GROUND_NET) == "none"
+    assert window.undo_stack.count() == before + 1
+
+    # the row is already unclassified now: a second run is a no-op, not a command
+    _menu_action(tab.view, "as Signal Nets").trigger()
     assert window.undo_stack.count() == before + 1
 
     window.undo_stack.undo()
-    assert model.data(model.index(row, model.column_index("net_class"))) == "ground"
+    assert _net_class(model, GROUND_NET) == "ground"
+
+
+def test_net_menu_voltage_and_ground_dialogs_cover_the_whole_selection(
+    qapp: QApplication, make_window, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    window = make_window()
+    spd = tmp_path / "mini.spd"
+    build_mini_spd(spd, style="si")
+    _load_via_thread(qapp, window, spd)
+    tab = window.net_tab
+    model = tab.model
+    # a second ground to pick from, so "Set paired ground…" has a real choice
+    second_ground = UNCLASSIFIED_NETS[0]
+    window.session.set_class(second_ground, "ground")
+    window._refresh_all_models()
+
+    tab.class_combo.setCurrentText("Power")
+    assert tab.proxy.shownCount() == 2
+    tab.view.selectAll()
+
+    monkeypatch.setattr(QInputDialog, "getDouble", staticmethod(lambda *a, **k: (0.9, True)))
+    _menu_action(tab.view, "Set voltage…").trigger()
+    voltage_col = model.column_index("voltage")
+    for net in (POWER_NET_A, POWER_NET_B):
+        assert model.cell_text(model.index(_net_row(model, net), voltage_col)) == "0.9"
+    assert window.status_label.text() == "Set 0.9 V on 2 nets."
+
+    monkeypatch.setattr(
+        QInputDialog, "getItem", staticmethod(lambda *a, **k: (second_ground, True))
+    )
+    _menu_action(tab.view, "Set paired ground…").trigger()
+    gnd_col = model.column_index("paired_gnd")
+    for net in (POWER_NET_A, POWER_NET_B):
+        assert model.cell_text(model.index(_net_row(model, net), gnd_col)) == second_ground
 
 
 def test_net_manager_auto_classify_toolbar_action(
@@ -585,18 +714,25 @@ def test_net_manager_auto_classify_toolbar_action(
     build_mini_spd(spd, style="si")
     _load_via_thread(qapp, window, spd)
 
-    # `Session.set_paired_ground(net, "")` immediately re-fills an empty pair
-    # via `_sync_rows()`'s own auto-choose (there is only one ground net in
-    # this fixture, so it always finds it) -- mutate the field directly to
-    # get a durably-unpaired net to exercise the toolbar action against.
-    window.session.nets[POWER_NET_A].paired_gnd = ""
+    # one power net dropped back to unclassified (its name still says `_VDD_`),
+    # and -- `Session.set_paired_ground(net, "")` immediately re-fills an empty
+    # pair via `_sync_rows()`'s own auto-choose -- one directly-unpaired net.
+    window.session.set_class(POWER_NET_A, "none")
+    window.session.nets[POWER_NET_B].paired_gnd = ""
     window._refresh_all_models()
-    assert window.session.nets[POWER_NET_A].paired_gnd == ""
 
     window._auto_classify()
 
-    assert window.session.nets[POWER_NET_A].paired_gnd == GROUND_NET
-    assert "Auto-classification" in window.status_label.text()
+    # name-based classification filled the gap the input left ...
+    assert window.session.nets[POWER_NET_A].net_class == "power"
+    assert window.session.nets[POWER_NET_A].voltage == pytest.approx(0.7)
+    # ... without touching signal nets or the `_PS`/`_GS` sense nets ...
+    for net in (*UNCLASSIFIED_NETS, *SENSE_NETS):
+        assert window.session.nets[net].net_class == "none", net
+    # ... and the ground pairing was re-run.
+    assert window.session.nets[POWER_NET_B].paired_gnd == GROUND_NET
+    assert window.status_label.text() == "Auto-classify: +1 power, +0 ground"
+    assert _net_class(window.net_tab.model, POWER_NET_A) == "power"
 
 
 # --------------------------------------------------------------------------- #

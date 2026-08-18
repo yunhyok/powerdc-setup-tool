@@ -34,6 +34,7 @@ from powerdc_setup_tool.core.netlist import parse_netlist, render_netlist
 from powerdc_setup_tool.core.session import (
     CLASS_POWER,
     Session,
+    classify_net_name,
     net_key,
     sink_key,
     split_key,
@@ -430,6 +431,187 @@ def test_autopair_keeps_a_preloaded_ground_unless_forced() -> None:
     assert session.nets["P_VDD_075_MAIN/0"].paired_gnd == "DGND"
     assert (net_key("P_VDD_075_MAIN/0"), "paired_gnd") in _keys(changed)
     assert {row.gnet for row in (*session.vrm_rows, *session.sink_rows)} == {"DGND"}
+
+
+# --------------------------------------------------------------------------- #
+# name-based auto-classification (v0.1.1)
+# --------------------------------------------------------------------------- #
+
+AUTO_POWER_NET = "ADC_VDD_070_VP_HSIO/0"  # the real design's power-net shape
+AUTO_SIGNAL_NETS = ("W_DDR9_BP_C0_DQ[8]/1", "AONI_GPIO[3]/0")  # ...and its signals
+AUTO_SENSE_NETS = ("ADC_VDD_070_VP_HSIO_PS/0", "ADC_VDD_070_VP_HSIO_GS/0")
+AUTO_GROUND_NET = "VSS_ANA"
+CLASSIFIED_POWER_NET = "ADC_VDD_105_VINT/0"  # already in `PowerNets` (§G.1)
+
+AUTO_CLASSIFY_BODY = (
+    "\t::Unselected||DropShape RiseTime = 0ps %Coupling = 0\n"
+    "\tGroundNets Color = LIME\n"
+    "\tPowerNets Color = RED\n"
+    f"\t{AUTO_POWER_NET}::Unselected||DropShape Color = RED\n"
+    f"\t{AUTO_SENSE_NETS[0]}::Unselected||DropShape Color = DARKCYAN\n"
+    f"\t{AUTO_SENSE_NETS[1]}::Unselected||DropShape Color = DARKBLUE\n"
+    f"\t{AUTO_SIGNAL_NETS[0]}::Unselected||DropShape Color = YELLOW\n"
+    f"\t{AUTO_SIGNAL_NETS[1]}::Unselected||DropShape Color = GREEN\n"
+    f"\t{AUTO_GROUND_NET}::Unselected||DropShape Color = LIME\n"
+    "\tDGND -> GroundNets Color = GREEN Voltage = 0\n"
+    f"\t{CLASSIFIED_POWER_NET} -> PowerNets Color = RED\n"
+)
+
+
+def _auto_classify_scan(**overrides: object) -> ScanResult:
+    """One power/one ground net already classified, five nets left for the name rule."""
+    return _make_scan(
+        AUTO_CLASSIFY_BODY,
+        {
+            "ALI1": {},
+            "SITE0": {
+                AUTO_POWER_NET: _pins("s", 2),
+                CLASSIFIED_POWER_NET: _pins("i", 2),
+                "DGND": _pins("t", 3),
+            },
+            "LGA": {
+                AUTO_POWER_NET: _pins("p", 3),
+                CLASSIFIED_POWER_NET: _pins("q", 3),
+                "DGND": _pins("g", 4),
+                AUTO_GROUND_NET: _pins("v", 1),
+            },
+        },
+        **overrides,
+    )
+
+
+def test_classify_net_name_knows_the_real_designs_power_and_signal_names() -> None:
+    for net in (
+        AUTO_POWER_NET,  # the exact real-design spelling
+        "ADC_VDD_120_VDDQ_DDRH/1",
+        "P_VDD_075_MAIN/0",
+        "AVDD_1V8",
+        "DDR_VCC",
+        "VPP_MAIN/0",
+        "VBAT",
+        "SOC_VINT/1",
+    ):
+        assert classify_net_name(net) == "power", net
+    for net in (*AUTO_SIGNAL_NETS, *UNCLASSIFIED_NETS, "W_MIPI_CLK_P/0", "RESET_N"):
+        assert classify_net_name(net) is None, net
+    # a signal that talks *about* a rail is not the rail
+    for net in ("PWR_GOOD", "VDD_EN", "VDDQ_PGOOD/0", "ADC_VDD_070_VP_HSIO_RST"):
+        assert classify_net_name(net) is None, net
+
+
+def test_classify_net_name_knows_the_ground_spellings_but_not_lookalikes() -> None:
+    for net in ("GND", "DGND", "AGND", "AGND2", "GND_A", "VSS", "VSSA", "DDR_VSS", "GROUND"):
+        assert classify_net_name(net) == "ground", net
+    # a *whole-name* rule: a rail that merely mentions a ground stays power.
+    assert classify_net_name("ADC_VDD_070_GND_REF/0") == "power"
+
+
+def test_classify_net_name_leaves_the_sense_nets_alone() -> None:
+    """§G.4: `_PS`/`_GS` are netlist-only sense nets, spelled like their rail."""
+    for net in (*AUTO_SENSE_NETS, "ADC_VDD_070_VP_HSIO_PS", "DGND_GS/1"):
+        assert classify_net_name(net) is None, net
+
+
+def test_auto_classify_by_name_fills_only_the_unclassified_nets() -> None:
+    session = Session()
+    session.load(_auto_classify_scan())
+    assert session.nets[AUTO_POWER_NET].net_class == "none"  # the input left it out
+
+    session.auto_classify_by_name()
+
+    assert session.nets[AUTO_POWER_NET].net_class == "power"
+    assert session.nets[AUTO_GROUND_NET].net_class == "ground"
+    # signal + remote-sense nets are not classifiable by name -> untouched
+    for net in (*AUTO_SIGNAL_NETS, *AUTO_SENSE_NETS):
+        assert session.nets[net].net_class == "none", net
+    # ...and neither the `.NetList`'s own markers nor `from_input` moved
+    assert session.nets[CLASSIFIED_POWER_NET].net_class == "power"
+    assert session.nets["DGND"].net_class == "ground"
+    assert session.nets[AUTO_POWER_NET].from_input is False
+
+
+def test_auto_classify_by_name_never_second_guesses_the_input_file() -> None:
+    """An input marker wins over the name rule, both ways round (§G.1)."""
+    body = (
+        "\t::Unselected||DropShape RiseTime = 0ps %Coupling = 0\n"
+        "\tGroundNets Color = LIME\n"
+        "\tPowerNets Color = RED\n"
+        f"\t{AUTO_POWER_NET} -> GroundNets Color = GREEN Voltage = 0\n"
+        f"\t{AUTO_GROUND_NET} -> PowerNets Color = RED\n"
+    )
+    session = Session()
+    session.load(
+        _make_scan(
+            body,
+            {"LGA": {AUTO_POWER_NET: _pins("p", 3), AUTO_GROUND_NET: _pins("v", 2)}},
+        )
+    )
+    assert session.nets[AUTO_POWER_NET].net_class == "ground"
+    assert session.nets[AUTO_GROUND_NET].net_class == "power"
+
+    assert session.auto_classify_by_name() == []
+
+    assert session.nets[AUTO_POWER_NET].net_class == "ground"
+    assert session.nets[AUTO_GROUND_NET].net_class == "power"
+
+
+def test_auto_classify_by_name_derives_voltage_pairing_and_rows() -> None:
+    session = Session()
+    session.load(_auto_classify_scan())
+    changed = session.auto_classify_by_name()
+
+    cfg = session.nets[AUTO_POWER_NET]
+    assert cfg.voltage == pytest.approx(0.70)  # spec §6 name-derived, not the 1.0 fallback
+    assert cfg.voltage_override is False
+    assert cfg.paired_gnd == "DGND"  # autopair default: most ground pins on the VRM comp
+    vrm = session.vrm(AUTO_POWER_NET)
+    sink = session.sink(AUTO_POWER_NET)
+    assert vrm is not None and sink is not None
+    assert (vrm.comp, vrm.gnet) == (VRM_COMP, "DGND")
+    assert (sink.comp, sink.gnet) == ("SITE0", "DGND")
+    assert vrm.nominal_voltage == pytest.approx(0.70)
+    assert sink.nominal_voltage == pytest.approx(0.70)
+
+    keys = _keys(changed)
+    assert (net_key(AUTO_POWER_NET), "net_class") in keys
+    assert (net_key(AUTO_GROUND_NET), "net_class") in keys
+    assert (vrm_key(AUTO_POWER_NET), "nominal_voltage") in keys
+    assert (sink_key(AUTO_POWER_NET), "comp") in keys
+    assert not any(key[0] == net_key(AUTO_SIGNAL_NETS[0]) for key in keys)
+
+
+def test_auto_classify_by_name_is_idempotent() -> None:
+    session = Session()
+    session.load(_auto_classify_scan())
+    assert session.auto_classify_by_name() != []
+    assert session.auto_classify_by_name() == []
+
+
+def test_auto_classify_by_name_keeps_a_user_voltage_override() -> None:
+    session = Session()
+    session.load(_auto_classify_scan())
+    session.set_net_voltage(AUTO_POWER_NET, 3.3)
+
+    session.auto_classify_by_name()
+
+    assert session.nets[AUTO_POWER_NET].net_class == "power"
+    assert session.nets[AUTO_POWER_NET].voltage == pytest.approx(3.3)
+    assert session.nets[AUTO_POWER_NET].voltage_override is True
+
+
+def test_auto_classify_by_name_changes_nothing_on_a_fully_classified_file(
+    tmp_path: Path,
+) -> None:
+    """The si fixture: every net is either classified, a signal or a sense net."""
+    session = Session()
+    session.load(_scan(tmp_path))
+    before = session.counts()
+
+    assert session.auto_classify_by_name() == []
+
+    assert session.counts() == before
+    for net in (*UNCLASSIFIED_NETS, *SENSE_NETS):
+        assert session.nets[net].net_class == "none", net
 
 
 # --------------------------------------------------------------------------- #
