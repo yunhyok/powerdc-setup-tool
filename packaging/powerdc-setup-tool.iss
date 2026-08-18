@@ -2,7 +2,7 @@
 #define MyAppPublisher "Yunhyok"
 #define MyAppExeName "SPD Manipulator for PowerDC.exe"
 #ifndef MyAppVersion
-#define MyAppVersion "0.1.2"
+#define MyAppVersion "0.1.3"
 #endif
 
 [Setup]

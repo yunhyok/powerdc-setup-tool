@@ -7,6 +7,30 @@ Sigrity PowerSI `.spd` design for PowerDC (DCR) analysis: classify nets, pair po
 return (ground) nets, set per-net voltages, and generate the `.VRM` / `.Sink` blocks PowerDC
 expects -- then stream out a new `.spd` file, leaving the original untouched.
 
+## v0.1.3
+
+Maintenance release: v0.1.2 built and ran fine locally but its Windows release job never finished,
+so no v0.1.2 installer was ever published. Behaviour is unchanged from v0.1.2 apart from the fixes
+below.
+
+- **CI hang fix** -- bulk edits (type-to-fill, fill down/right, paste, *Check/Uncheck all (shown)*,
+  *Classify*, undo/redo) now suspend the sort/filter proxies' dynamic re-sorting while they write
+  and re-sort once at the end, instead of letting every single cell write re-sort and re-filter the
+  table underneath the operation. *Check/Uncheck all (shown)* also resolves the shown rows before
+  it writes the first one. Same results, no rows moving mid-operation, and large bulk edits are
+  much faster.
+- **Sort comparator made a strict weak ordering** -- the v0.1.2 comparator mixed numeric and text
+  comparison within one column and treated `NaN` as equal to everything, either of which is
+  undefined behaviour inside the C++ sort Qt hands it to (a possible non-terminating sort, and one
+  that can behave differently on Windows than on Linux). Values are now bucketed and never compared
+  across buckets, with the input file's row order as a final tie-break.
+- **Per-test timeouts** -- the test suite fails a hung test after 180 s (600 s for the `slow`
+  200 MB perf tests) with a full thread dump, and the release job as a whole is capped at 30
+  minutes, so a hang shows up as a named failing test within minutes instead of a silent six-hour
+  kill with no logs.
+- **Qt pinned to `PySide6>=6.7,<6.12`** -- release builds no longer pick up an untested newer Qt
+  minor on their own.
+
 ## v0.1.2
 
 - **Column-header sorting on all three tables** -- click any header to sort ascending/descending,

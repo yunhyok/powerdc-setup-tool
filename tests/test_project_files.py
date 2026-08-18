@@ -86,7 +86,7 @@ def test_iss_defines_app_metadata_and_fresh_appid() -> None:
     assert NEW_APP_APPID in iss
     # Must not reuse the old app's installer identity.
     assert OLD_APP_APPID not in iss
-    assert "MyAppVersion" in iss and '"0.1.2"' in iss
+    assert "MyAppVersion" in iss and '"0.1.3"' in iss
     assert "SPD Manipulator for PowerDC" in iss  # DefaultDirName / Files source
     assert "desktopicon" in iss
     assert "Compression=lzma" in iss
@@ -167,6 +167,32 @@ def test_workflow_contents() -> None:
     assert "0.0.0-dev" in workflow
 
 
+def test_ci_cannot_hang_for_six_hours_again() -> None:
+    """v0.1.3 guardrails: a job ceiling, per-test timeouts, and a Qt cap.
+
+    The v0.1.2 release job hung inside `pytest` and was killed at GitHub's
+    6-hour default, which discards the logs -- so the run that could have named
+    the offending test produced nothing at all. Each of these three is what
+    turns that outcome into a named failure in minutes, and each is a one-line
+    edit away from being silently dropped.
+    """
+    workflow = _read(".github/workflows/build.yml")
+    assert "timeout-minutes: 30" in workflow
+
+    pyproject = tomllib.loads(_read("pyproject.toml"))
+    pytest_ini = pyproject["tool"]["pytest"]["ini_options"]
+    assert pytest_ini["timeout"] == 180
+    # "thread" dumps every thread's stack on expiry; "signal" cannot interrupt a
+    # blocked Qt event loop and is not available on Windows anyway.
+    assert pytest_ini["timeout_method"] == "thread"
+    assert "pytest-timeout" in pyproject["project"]["optional-dependencies"]["dev"]
+
+    # Qt capped to the validated series -- the release runner installs whatever
+    # is newest at build time otherwise.
+    requirements = pyproject["project"]["dependencies"]
+    assert "PySide6>=6.7,<6.12" in requirements
+
+
 # ---------------------------------------------------------------------------
 # .gitignore / .gitattributes
 # ---------------------------------------------------------------------------
@@ -235,7 +261,7 @@ def test_pyproject_matches_package_name_script_and_version() -> None:
     project = pyproject["project"]
 
     assert project["name"] == "powerdc-setup-tool"
-    assert project["version"] == "0.1.2"
+    assert project["version"] == "0.1.3"
 
     scripts = project.get("scripts", {})
     assert scripts.get("powerdc-setup-tool") == "powerdc_setup_tool.app:main"
@@ -270,6 +296,9 @@ def test_readme_carries_the_current_version_changelog() -> None:
     readme = _read("README.md")
 
     assert f"## v{version}" in readme
-    # v0.1.2's five headline items.
+    # v0.1.3's headline items (the CI-hang maintenance release)...
+    for phrase in ("CI hang fix", "strict weak ordering", "Per-test timeouts", "PySide6>=6.7,<6.12"):
+        assert phrase in readme, phrase
+    # ...and v0.1.2's, which the changelog keeps below it.
     for phrase in ("sort", "Check all", "Paired GND", "Auto-classif", "Source"):
         assert phrase in readme, phrase

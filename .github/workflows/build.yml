@@ -12,6 +12,11 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    # v0.1.3: the v0.1.2 run hung inside `pytest` and was killed at the 6-hour
+    # job ceiling, which produced no logs at all. A tight job ceiling fails fast,
+    # and the per-test `timeout` in `pyproject.toml` (180 s, thread method --
+    # which dumps every thread's stack) is what names the offending test.
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4

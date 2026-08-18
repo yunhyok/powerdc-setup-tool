@@ -4,17 +4,22 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "powerdc-setup-tool"
-version = "0.1.2"
+version = "0.1.3"
 description = "SPD Manipulator for PowerDC"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "PySide6>=6.7",
+    # v0.1.3: capped at the locally validated 6.11.x series. The CI runner
+    # installs whatever is newest at build time, and the whole v0.1.2 Windows
+    # job hung in the Qt table/sort layer -- an untested newer minor is not
+    # something a release build should pick up on its own.
+    "PySide6>=6.7,<6.12",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest",
+    "pytest-timeout",
     "pyinstaller",
 ]
 
@@ -27,6 +32,8 @@ where = ["src"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+timeout = 180
+timeout_method = "thread"
 markers = [
     "slow: marks tests as slow (deselect with -m \"not slow\")",
 ]

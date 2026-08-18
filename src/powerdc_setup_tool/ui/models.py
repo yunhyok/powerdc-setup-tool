@@ -35,13 +35,32 @@ v0.1.2
 * **`ColumnSpec.tooltip`** -- static header/cell help text; the *Source* column
   uses it, and it now reports `Session.class_source` (``input``/``auto``/
   ``user``/``""``) instead of the old ``input``/``new`` split of `from_input`.
+
+v0.1.3 (hang hardening)
+-----------------------
+The v0.1.2 Windows release job never finished. Three things here were the
+plausible mechanisms, and all three are now closed:
+
+* `ConfigSortProxy.lessThan` was **not a strict weak ordering** (mixed numeric/
+  text comparison within one column, and `NaN`), which is undefined behaviour
+  inside the C++ sort Qt calls it from -- "may not terminate" included, and it
+  fails differently per standard library, which fits "hangs on Windows, fine on
+  Linux". `_sort_key` makes it a total order.
+* `frozen_sorting` suspends the proxies' dynamic re-sort/re-filter for the whole
+  of a bulk write, so N cell writes cost one re-sort instead of N, and no row
+  can move underneath an operation that is still running.
+* `apply_changed_keys` folds re-entrant calls into the one already running
+  instead of recursing, since it emits `dataChanged` and anything a slot on that
+  signal does runs inside the emit.
 """
 
 from __future__ import annotations
 
 import fnmatch
+import math
 import weakref
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -88,6 +107,8 @@ __all__ = [
     "ERROR_BACKGROUND",
     "config_model",
     "source_index",
+    "proxy_chain",
+    "frozen_sorting",
     "format_number",
 ]
 
@@ -164,6 +185,44 @@ def config_model(model: Any) -> BaseConfigModel | None:
     while isinstance(model, QAbstractProxyModel):
         model = model.sourceModel()
     return model if isinstance(model, BaseConfigModel) else None
+
+
+def proxy_chain(model: Any) -> list[QAbstractProxyModel]:
+    """Every proxy stacked on top of a `BaseConfigModel`, view-side first."""
+    chain: list[QAbstractProxyModel] = []
+    while isinstance(model, QAbstractProxyModel):
+        chain.append(model)
+        model = model.sourceModel()
+    return chain
+
+
+@contextmanager
+def frozen_sorting(model: Any) -> Iterator[None]:
+    """Suspend dynamic re-sort/re-filter on *model*'s proxies for a bulk write.
+
+    v0.1.3 hang hardening. With `dynamicSortFilter` on, **every** `dataChanged`
+    a `Session` mutator produces makes `QSortFilterProxyModel` re-run
+    `filterAcceptsRow` and re-insert the row with a binary search that calls
+    `ConfigSortProxy.lessThan` -- a *Python* comparator reached from C++. A bulk
+    operation over N rows therefore pays N re-sorts (O(N^2 log N) Python calls
+    on a 3712-net table) and, worse, reorders the proxy underneath any caller
+    still walking proxy rows.
+
+    Freezing for the duration of the write and invalidating once at the end
+    gives the same final ordering for one sort instead of N, and makes the
+    "rows move mid-iteration" class of bug unreachable.
+    """
+    proxies = [proxy for proxy in proxy_chain(model) if isinstance(proxy, QSortFilterProxyModel)]
+    frozen = [proxy for proxy in proxies if proxy.dynamicSortFilter()]
+    for proxy in frozen:
+        proxy.setDynamicSortFilter(False)
+    try:
+        yield
+    finally:
+        # Restore innermost-first, so the outer proxy re-reads a settled source.
+        for proxy in reversed(frozen):
+            proxy.setDynamicSortFilter(True)
+            proxy.invalidate()
 
 
 def _circuit_names(session: Session) -> list[str]:
@@ -395,6 +454,9 @@ class BaseConfigModel(QAbstractTableModel):
         self._structure_version = -1
         self._issues: dict[str, list[str]] | None = None
         self._names: dict[str, str] | None = None
+        #: v0.1.3 `apply_changed_keys` re-entrancy guard (see that method).
+        self._applying = False
+        self._deferred_keys: list[ChangedKey] = []
 
         self._build_field_map()
         self._reload()
@@ -749,7 +811,30 @@ class BaseConfigModel(QAbstractTableModel):
         A key naming a row of another kind (the design §B cascade: a net edit
         moving VRM/Sink cells) repaints this model's whole row for that net --
         that is also what keeps derived columns such as *Pins @VRM comp* fresh.
+
+        Re-entrant calls are folded into the one already running (v0.1.3). This
+        method emits `dataChanged`, and anything a slot on that signal does --
+        a proxy re-sort, a `layoutChanged` handler, a status-bar refresh --
+        runs *inside* the emit. A slot that writes back to the session would
+        otherwise re-enter here and recurse without a base case; merging the
+        keys into the outer pass keeps the repaint correct and the stack finite.
         """
+        keys = list(keys)
+        if self._applying:
+            self._deferred_keys.extend(keys)
+            return
+        self._applying = True
+        try:
+            while True:
+                self._apply_changed_keys(keys)
+                if not self._deferred_keys:
+                    return
+                keys, self._deferred_keys = self._deferred_keys, []
+        finally:
+            self._applying = False
+            self._deferred_keys = []
+
+    def _apply_changed_keys(self, keys: Sequence[ChangedKey]) -> None:
         self._invalidate_caches()
         if self.session.structure_version != self._structure_version:
             self.refresh_from_session()
@@ -1088,30 +1173,69 @@ class ConfigSortProxy(QSortFilterProxyModel):
     numerically), and `lessThan` breaks ties on the *source* row, which keeps
     equal cells in netlist order instead of an arbitrary one and makes a sort
     reproducible between runs.
+
+    Comparator safety (v0.1.3)
+    --------------------------
+    `lessThan` is handed straight to `std::stable_sort`/`std::lower_bound`
+    inside `QSortFilterProxyModel`, and those are **undefined behaviour** unless
+    it is a strict weak ordering -- undefined as in "may never terminate", and
+    the MSVC and libstdc++ implementations fail differently, so a comparator
+    that is merely lucky on Linux is not evidence about Windows.
+
+    The 0.1.2 version was not a strict weak ordering. It compared numerically
+    when both values happened to be numbers and *textually* when they did not,
+    which is intransitive as soon as one cell in a column is not a number:
+    ``2.0 < 10.0`` numerically, ``10.0 < "15"`` textually, ``"15" < 2.0``
+    textually -- a cycle. `NaN` broke it a second way: it is equal to and less
+    than nothing, so ``nan ~ 5.0`` and ``nan ~ 7.0`` while ``5.0 < 7.0``, which
+    breaks transitivity of equivalence. A user typing ``nan`` into *Voltage (V)*
+    is enough to reach it (`float("nan")` parses).
+
+    `_sort_key` fixes both by mapping every cell to one totally ordered tuple:
+    values are bucketed (empty < number < text), never compared across buckets,
+    and `NaN` gets a bucket of its own. `left.row()` is the final tie-break, so
+    the ordering is total -- no two distinct rows ever compare equivalent.
     """
+
+    #: `_sort_key` buckets. Values in different buckets never compare by value,
+    #: which is what makes the ordering transitive on a mixed-type column.
+    _RANK_EMPTY = 0
+    _RANK_NUMBER = 1
+    _RANK_TEXT = 2
+    _RANK_NAN = 3
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self.setDynamicSortFilter(True)
         self.setSortRole(SORT_ROLE)
 
+    @classmethod
+    def _sort_key(cls, value: Any) -> tuple[int, float, str]:
+        """A cell value -> a tuple that is totally ordered against any other.
+
+        Pure and side-effect free: it must never call back into the model or
+        emit anything, because Qt calls it from inside a sort.
+        """
+        if value is None:
+            return (cls._RANK_EMPTY, 0.0, "")
+        if isinstance(value, (int, float)) and not isinstance(value, complex):
+            # `bool` is an `int`: False/True order as 0/1, as they did in 0.1.2.
+            number = float(value)
+            if math.isnan(number):
+                return (cls._RANK_NAN, 0.0, "")
+            return (cls._RANK_NUMBER, number, "")
+        text = str(value)
+        if not text:
+            return (cls._RANK_EMPTY, 0.0, "")
+        return (cls._RANK_TEXT, 0.0, text)
+
     def lessThan(self, left: QModelIndex, right: QModelIndex) -> bool:
-        a = left.data(self.sortRole())
-        b = right.data(self.sortRole())
-        if a is None or b is None:
-            if a is None and b is None:
-                return left.row() < right.row()
-            return b is not None  # empties sort first, ascending
-        try:
-            if a == b:
-                return left.row() < right.row()
-            return bool(a < b)
-        except TypeError:
-            pass  # mixed types (a cleared numeric cell next to a filled one)
-        text_a, text_b = str(a), str(b)
-        if text_a == text_b:
-            return left.row() < right.row()
-        return text_a < text_b
+        role = self.sortRole()
+        a = self._sort_key(left.data(role))
+        b = self._sort_key(right.data(role))
+        if a == b:
+            return left.row() < right.row()  # stable: ties keep netlist order
+        return a < b
 
 
 class NetFilterProxy(ConfigSortProxy):

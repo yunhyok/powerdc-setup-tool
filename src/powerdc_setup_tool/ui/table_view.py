@@ -35,6 +35,15 @@ rows however the view is ordered in between. Two places did still hold a row
 number across a model write and were moved onto keys: `note_pending_edit`
 (`_PendingEdit.row_key`) and `apply_bulk`'s anchor, because the delegate's
 commit re-sorts the proxy *before* `bulkApplyRequested` reaches the view.
+
+v0.1.3 closes the other half of that: `BulkEditCommand.redo`/`undo` now wrap the
+write in `frozen_sorting`, which suspends the proxies' dynamic re-sort/re-filter
+until the whole operation is done. v0.1.2 was *correct* under a live sort only
+because it addressed cells by key -- but it still paid one full re-sort of the
+table (through a Python comparator) per cell written, and left every operation
+that walks proxy rows one refactor away from reading a table that moved under
+it. `check_all_shown`, the one such loop v0.1.2 added, now resolves its rows to
+source indices before the first write.
 """
 
 from __future__ import annotations
@@ -66,6 +75,7 @@ from powerdc_setup_tool.ui.models import (
     BaseConfigModel,
     ColumnSpec,
     config_model,
+    frozen_sorting,
     source_index,
 )
 
@@ -135,6 +145,9 @@ class BulkEditCommand(QUndoCommand):
     ) -> None:
         super().__init__(text, parent)
         self._model = config_model(model) or model
+        # v0.1.3: the view-side model (proxies included), so `redo`/`undo` can
+        # suspend dynamic re-sorting while they write -- see `frozen_sorting`.
+        self._view_model = model
         self._changes: list[_CellChange] = []
         for entry in changes:
             change = self._build(entry)
@@ -179,31 +192,43 @@ class BulkEditCommand(QUndoCommand):
 
     # -- QUndoCommand ----------------------------------------------------- #
 
+    def _reset_auto(self, cells: Sequence[_CellChange]) -> None:
+        """`reset_auto` the given cells, resolving their indices *now*.
+
+        v0.1.3: the indices are built here rather than accumulated during the
+        write loop, because a `Session` mutator that adds a row resets the model
+        and invalidates every index handed out before it.
+        """
+        indexes = [self._model.index_for_key(cell.row_key, cell.column) for cell in cells]
+        indexes = [index for index in indexes if index.isValid()]
+        if indexes:
+            self._model.reset_auto(indexes)
+
     def redo(self) -> None:
-        resets: list[QModelIndex] = []
-        for change in self._changes:
-            index = self._model.index_for_key(change.row_key, change.column)
-            if not index.isValid():
-                continue
-            if change.is_reset:
-                resets.append(index)
-            else:
-                self._model.setData(index, change.new, Qt.ItemDataRole.EditRole)
-        if resets:
-            self._model.reset_auto(resets)
+        with frozen_sorting(self._view_model):
+            resets: list[_CellChange] = []
+            for change in self._changes:
+                # Re-resolved per cell by stable `Session` key: a mutator can
+                # add a row (`_ensure_ground`) and reset the model mid-loop.
+                if change.is_reset:
+                    resets.append(change)
+                    continue
+                index = self._model.index_for_key(change.row_key, change.column)
+                if index.isValid():
+                    self._model.setData(index, change.new, Qt.ItemDataRole.EditRole)
+            self._reset_auto(resets)
 
     def undo(self) -> None:
-        resets: list[QModelIndex] = []
-        for change in reversed(self._changes):
-            index = self._model.index_for_key(change.row_key, change.column)
-            if not index.isValid():
-                continue
-            if change.resettable and not change.old_override:
-                resets.append(index)
-            else:
-                self._model.setData(index, change.old, Qt.ItemDataRole.EditRole)
-        if resets:
-            self._model.reset_auto(resets)
+        with frozen_sorting(self._view_model):
+            resets: list[_CellChange] = []
+            for change in reversed(self._changes):
+                if change.resettable and not change.old_override:
+                    resets.append(change)
+                    continue
+                index = self._model.index_for_key(change.row_key, change.column)
+                if index.isValid():
+                    self._model.setData(index, change.old, Qt.ItemDataRole.EditRole)
+            self._reset_auto(resets)
 
 
 class BulkEditTableView(QTableView):
@@ -283,12 +308,25 @@ class BulkEditTableView(QTableView):
         table is built. Parking the indicator on -1 first makes the initial
         `sortByColumn` a no-op (`QSortFilterProxyModel.sort(-1)` = source
         order), so the first ordering the user sees is still design §D's.
+
+        v0.1.3: the parking write is made with the header's signals blocked and
+        the call is idempotent. `setSortingEnabled(True)` connects
+        `sortIndicatorChanged` to the view's own re-sort slot; calling this a
+        second time on the same view (after a second `setModel`, say) would
+        otherwise drive an indicator change through a live connection for no
+        reason. Blocking is safe because nothing is connected yet on the first
+        call and the indicator is being *cleared*, not applied.
         """
         header = self.horizontalHeader()
-        header.setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
+        blocked = header.blockSignals(True)
+        try:
+            header.setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
+        finally:
+            header.blockSignals(blocked)
         header.setSortIndicatorShown(True)
         header.setSectionsClickable(True)
-        self.setSortingEnabled(True)
+        if not self.isSortingEnabled():
+            self.setSortingEnabled(True)
 
     def setExtraMenuBuilder(self, builder: Callable[[QMenu], None] | None) -> None:
         """Install a hook that prepends tab-specific entries to the context menu.
@@ -716,15 +754,22 @@ class BulkEditTableView(QTableView):
         *Check selected*, for the case where selecting the whole filtered set
         first is the tedious part. Still one `BulkEditCommand`, so one Ctrl+Z
         puts every row back.
+
+        The shown rows are mapped to **source** indices before anything is
+        written (v0.1.3). Walking proxy row numbers and writing through them in
+        the same pass is the re-sort-during-iteration trap: with
+        `dynamicSortFilter` on, the first write can reorder or re-filter the
+        proxy and every row number after it addresses a different net.
         """
         column = self._bool_column()
         model = self.model()
         if column < 0 or model is None:
             return 0
         indexes = [
-            index
+            local
             for row in range(model.rowCount())
             if (index := self._index(row, column)).isValid()
+            and (local := source_index(index)).isValid()
         ]
         count = self.toggle_cells(
             indexes, checked=checked, text="Check all shown" if checked else "Uncheck all shown"

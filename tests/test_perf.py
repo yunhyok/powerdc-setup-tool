@@ -192,6 +192,7 @@ def test_scaled_pipeline_sanity(tmp_path: Path) -> None:
 
 
 @pytest.mark.slow
+@pytest.mark.timeout(600)
 def test_full_scale_pipeline(tmp_path: Path) -> None:
     """design §E: 200 MB synthetic -- scan < 60 s, write < 120 s, RSS < 256 MB."""
     source = tmp_path / "big.spd"
@@ -224,6 +225,7 @@ def test_full_scale_pipeline(tmp_path: Path) -> None:
 
 
 @pytest.mark.slow
+@pytest.mark.timeout(600)
 def test_full_scale_crlf_input_yields_lf_only_contiguous_output(tmp_path: Path) -> None:
     """design §G.6 (LF-only output) and §D step 5 (no blank line between blocks),
     on a 200 MB **CRLF** input.

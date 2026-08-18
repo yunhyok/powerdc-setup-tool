@@ -21,6 +21,7 @@ import os
 # design §E: the offscreen platform must be selected before PySide6 is imported.
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import time  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 import pytest  # noqa: E402
@@ -855,6 +856,217 @@ def test_check_all_shown_covers_the_filter_not_the_selection(session: Session) -
     assert view.check_all_shown(True) == 0
     assert view.undo_stack.count() == pushed
     assert messages[-1] == "No shown rows to check."
+
+
+# --------------------------------------------------------------------------- #
+# v0.1.3: the sort comparator must be a strict weak ordering
+# --------------------------------------------------------------------------- #
+
+
+#: Values one column can plausibly hold at once. `NaN` is reachable by typing
+#: "nan" into *Voltage (V)* (`float("nan")` parses); a stray string reaches a
+#: numeric column from a hand-edited config. Both were undefined behaviour in
+#: the v0.1.2 comparator -- see `ConfigSortProxy`.
+_MIXED_SORT_VALUES: tuple[object, ...] = (
+    None, "", 0, 1, False, True, 2.0, 10.0, -3.5,
+    "15", "abc", "0.7", float("nan"), float("inf"), float("-inf"),
+)
+
+
+def test_sort_comparator_is_a_strict_weak_ordering() -> None:
+    """Qt hands `lessThan` to `std::stable_sort`/`std::lower_bound`, which are
+    undefined behaviour -- "may not terminate" included -- on a comparator that
+    is not a strict weak ordering. Windows and Linux fail differently there, so
+    the property is checked directly rather than inferred from "the sort looked
+    right on this machine".
+
+    Checked on `_sort_key` (all of `lessThan` bar the row tie-break), so it
+    holds for every pair of values a column can hold, not just the handful a
+    fixture happens to produce.
+    """
+    keys = [ConfigSortProxy._sort_key(value) for value in _MIXED_SORT_VALUES]
+
+    for a in keys:  # irreflexive
+        assert not a < a
+    for a in keys:  # asymmetric
+        for b in keys:
+            assert not (a < b and b < a)
+    for a in keys:  # transitive
+        for b in keys:
+            for c in keys:
+                if a < b and b < c:
+                    assert a < c
+    for a in keys:  # transitivity of equivalence -- this is what NaN broke
+        for b in keys:
+            for c in keys:
+                if not (a < b or b < a) and not (b < c or c < b):
+                    assert not (a < c or c < a)
+
+    # the ordering the buckets encode: empty first, then numbers, then text
+    assert ConfigSortProxy._sort_key(None) == ConfigSortProxy._sort_key("")
+    assert ConfigSortProxy._sort_key(2.0) < ConfigSortProxy._sort_key(10.0)
+    assert ConfigSortProxy._sort_key(None) < ConfigSortProxy._sort_key(0)
+    assert ConfigSortProxy._sort_key(10.0) < ConfigSortProxy._sort_key("15")
+    assert ConfigSortProxy._sort_key(False) < ConfigSortProxy._sort_key(True)
+
+
+def test_a_nan_voltage_does_not_break_sorting(session: Session) -> None:
+    """The concrete reachable case: type "nan" into *Voltage (V)*, then sort."""
+    model = NetTableModel(session)
+    view, proxy = sorted_view(model)
+    session.set_net_voltage(POWER_NET_A, float("nan"))
+    model.refresh_from_session()
+
+    expected = sorted(model.net_for_row(row) for row in range(model.rowCount()))
+    for order in (Qt.SortOrder.AscendingOrder, Qt.SortOrder.DescendingOrder):
+        view.sortByColumn(NET_V, order)
+        # every row still present, exactly once -- a comparator Qt's sort cannot
+        # trust drops or duplicates rows long before it hangs
+        assert proxy.rowCount() == model.rowCount()
+        assert sorted(shown_nets(model, proxy)) == expected
+
+
+# --------------------------------------------------------------------------- #
+# v0.1.3: bulk edits under a live sort (the CI-hang regression)
+# --------------------------------------------------------------------------- #
+
+
+#: Synthetic nets for the stress test. Big enough that a re-sort-per-cell loop
+#: or a rows-move-mid-iteration bug shows up as a wrong result or a blown
+#: budget, small enough that a healthy run is well under a second.
+STRESS_NETS = 200
+
+#: Wall-clock ceiling for the stress body -- ~2 orders of magnitude of head-room
+#: over a healthy run, so it fires on an O(n^3) regression rather than on a slow
+#: build agent. `pytest-timeout`'s 180 s is the backstop for a sort that never
+#: terminates at all.
+STRESS_BUDGET_S = 60.0
+
+
+def stress_session(session: Session) -> list[str]:
+    """Add `STRESS_NETS` synthetic power nets; returns their names in row order.
+
+    Voltages repeat on a short cycle, so the sorted column is *volatile*: each
+    write moves rows past each other, which is the condition a proxy re-sorting
+    mid-operation needs in order to corrupt the result. They are spelled as spec
+    §6 `_VDD_<ccc>_` codes, so each net's starting voltage is also its *auto*
+    value and the undo of a fill (which restores an un-overridden cell through
+    `Session.reset_auto`, not by writing the number back) lands exactly.
+    """
+    nets: list[str] = []
+    for i in range(STRESS_NETS):
+        net = _stress_net(i)
+        session._add_net(
+            PowerNetConfig(
+                net=net,
+                net_class="power",
+                paired_gnd=GROUND_NET,
+                voltage=_stress_voltage(i),
+                selected=(i % 3 != 0),
+                die=i % 2,
+            )
+        )
+        nets.append(net)
+    session.structure_version += 1
+    session.derive_all()
+    return nets
+
+
+def _stress_code(index: int) -> int:
+    """A three-digit `_VDD_<ccc>_` voltage code, cycling over 37 values."""
+    return 50 + (index % 37) * 5
+
+
+def _stress_net(index: int) -> str:
+    return f"SYN_VDD_{_stress_code(index):03d}_R{index:04d}/{index % 2}"
+
+
+def _stress_voltage(index: int) -> float:
+    return _stress_code(index) / 100.0
+
+
+def test_bulk_edits_under_a_live_sort_finish_and_hit_every_row(session: Session) -> None:
+    """v0.1.3 regression for the v0.1.2 CI hang -- reproducible on any platform.
+
+    Sorting is live on *Voltage (V)* -- the very column being written -- with
+    `dynamicSortFilter` on, which is the configuration where every `setData`
+    makes the proxy re-run `filterAcceptsRow` and re-insert the row through a
+    Python comparator. Under that load this drives the three bulk paths that
+    walk rows (`check_all_shown`, multi-cell type-to-fill, paste) and asserts
+    they finish *and* land on every row exactly once: a proxy reordering
+    underneath an in-flight operation shows up here as skipped or
+    double-written rows, not merely as slowness.
+    """
+    synthetic = stress_session(session)
+    model = NetTableModel(session)
+    view, proxy = sorted_view(model, NetFilterProxy())
+    assert proxy.dynamicSortFilter()
+    view.sortByColumn(NET_V, Qt.SortOrder.AscendingOrder)
+
+    total = model.rowCount()
+    assert proxy.rowCount() == total >= STRESS_NETS
+
+    # Every `layoutChanged` is one full re-sort of the table through the Python
+    # comparator. A bulk operation is allowed a couple (it re-sorts once when it
+    # finishes); one *per written cell* is the v0.1.2 behaviour this release
+    # fixes, and is what turns a big table's bulk edit quadratic.
+    resorts: list[object] = []
+    proxy.layoutChanged.connect(lambda *_a: resorts.append(None))
+
+    started = time.monotonic()
+
+    # -- 1. Check / Uncheck all (shown) -------------------------------------- #
+    unchecked = [net for net, cfg in session.nets.items() if not cfg.selected]
+    assert unchecked, "the fixture must start with something left to check"
+    assert view.check_all_shown(True) == len(unchecked)
+    assert all(cfg.selected for cfg in session.nets.values())  # no row skipped
+
+    assert view.check_all_shown(False) == total
+    assert not any(cfg.selected for cfg in session.nets.values())
+    view.undo_stack.undo()
+    assert all(cfg.selected for cfg in session.nets.values())
+
+    # -- 2. multi-cell type-to-fill down the sorted column -------------------- #
+    editable = [
+        model.net_for_row(row)
+        for row in range(total)
+        if model.is_editable(model.index(row, NET_V))
+    ]
+    select(view, (0, NET_V), (proxy.rowCount() - 1, NET_V), current=(0, NET_V))
+    anchor = proxy.index(0, NET_V)
+    # exactly what `NumericDelegate.setModelData` does, in that order: the
+    # commit re-sorts the proxy *before* the bulk apply is reached
+    view.note_pending_edit(anchor)
+    proxy.setData(anchor, "0.33", Qt.ItemDataRole.EditRole)
+    assert view.apply_bulk("0.33", anchor) == len(editable)
+    assert {session.nets[net].voltage for net in editable} == {0.33}
+
+    # -- 3. paste, broadcast down the whole sorted column --------------------- #
+    select(view, (0, NET_V), (proxy.rowCount() - 1, NET_V), current=(0, NET_V))
+    assert view.paste_grid(view.parse_clipboard_grid("0.91")) == len(editable)
+    assert {session.nets[net].voltage for net in editable} == {0.91}
+
+    elapsed = time.monotonic() - started
+    assert elapsed < STRESS_BUDGET_S, f"bulk edits took {elapsed:.1f}s under a live sort"
+
+    # 7 bulk operations so far, ~2 re-sorts each; the per-cell behaviour would
+    # be several hundred for the same work.
+    assert len(resorts) <= 40, f"{len(resorts)} re-sorts for {len(editable)}-cell bulk edits"
+
+    # -- final state: rows intact, ordering consistent, undo still exact ------ #
+    assert proxy.rowCount() == total == model.rowCount()
+    assert sorted(shown_nets(model, proxy)) == sorted(
+        model.net_for_row(row) for row in range(total)
+    )
+    voltages = [proxy.index(row, NET_V).data(SORT_ROLE) for row in range(proxy.rowCount())]
+    assert voltages == sorted(voltages, key=ConfigSortProxy._sort_key)
+
+    view.undo_stack.undo()  # the paste
+    assert {session.nets[net].voltage for net in editable} == {0.33}
+    view.undo_stack.undo()  # the type-to-fill
+    assert [session.nets[net].voltage for net in synthetic] == [
+        _stress_voltage(i) for i in range(STRESS_NETS)
+    ]
 
 
 # --------------------------------------------------------------------------- #
