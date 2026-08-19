@@ -32,7 +32,7 @@ from pathlib import Path  # noqa: E402
 
 import pytest  # noqa: E402
 from PySide6.QtCore import Qt  # noqa: E402
-from PySide6.QtGui import QUndoStack  # noqa: E402
+from PySide6.QtGui import QAction, QUndoStack  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication,
     QDialog,
@@ -51,7 +51,8 @@ from fixtures import (  # noqa: E402
     build_mini_spd,
     expected_dc,
 )
-from powerdc_setup_tool.core.session import Session  # noqa: E402
+from powerdc_setup_tool.core.columns import SINK_COLUMNS, VRM_COLUMNS  # noqa: E402
+from powerdc_setup_tool.core.session import Session, sink_key, vrm_key  # noqa: E402
 from powerdc_setup_tool.core.spd_scan import ScanCancelled, scan_spd  # noqa: E402
 from powerdc_setup_tool.ui import main_window as main_window_mod  # noqa: E402
 from powerdc_setup_tool.ui import workers as workers_mod  # noqa: E402
@@ -66,6 +67,13 @@ from powerdc_setup_tool.ui.models import (  # noqa: E402
 from powerdc_setup_tool.ui.net_manager import NetManagerTab  # noqa: E402
 from powerdc_setup_tool.ui.sink_tab import SinkTab  # noqa: E402
 from powerdc_setup_tool.ui.vrm_tab import VrmTab  # noqa: E402
+
+# The workbook editing helpers of the core Excel tests, reused here so the GUI
+# test drives exactly the file shape `test_xlsx_io.py` pins (`test_writer` is
+# imported by `test_chunk_boundary` the same way).
+from test_xlsx_io import _edit as xlsx_edit  # noqa: E402
+from test_xlsx_io import _rewrite as xlsx_rewrite  # noqa: E402
+from test_xlsx_io import _rows as xlsx_rows  # noqa: E402
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -1121,3 +1129,195 @@ def test_failed_config_load_leaves_the_undo_stack_alone(
     )
     window._load_config()
     assert window.undo_stack.count() == 1
+
+
+# --------------------------------------------------------------------------- #
+# Excel round trip (v0.1.4)
+# --------------------------------------------------------------------------- #
+
+
+def _export_xlsx(
+    qapp: QApplication, window: MainWindow, monkeypatch: pytest.MonkeyPatch, target: Path
+) -> Path:
+    monkeypatch.setattr(
+        QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: (str(target), ""))
+    )
+    window._export_xlsx()
+    assert target.exists()
+    return target
+
+
+def _import_xlsx(
+    window: MainWindow, monkeypatch: pytest.MonkeyPatch, source: Path, *, confirm: bool = True
+) -> None:
+    monkeypatch.setattr(
+        QFileDialog, "getOpenFileName", staticmethod(lambda *a, **k: (str(source), ""))
+    )
+    monkeypatch.setattr(MainWindow, "_confirm_import", lambda self, path, report: confirm)
+    window._import_xlsx()
+
+
+def test_gui_tables_and_the_excel_manifest_cannot_drift_apart() -> None:
+    """v0.1.4: both are built from `core/columns.py`, so this stays true."""
+    for model, defs in ((VrmTableModel, VRM_COLUMNS), (SinkTableModel, SINK_COLUMNS)):
+        assert [spec.key for spec in model.COLUMNS] == [column.key for column in defs]
+        assert [spec.title for spec in model.COLUMNS] == [column.title for column in defs]
+        assert [spec.kind for spec in model.COLUMNS] == [column.kind for column in defs]
+        assert [spec.editable for spec in model.COLUMNS] == [column.editable for column in defs]
+
+
+def test_excel_export_then_import_applies_edits_as_one_undo_step(
+    qapp: QApplication, make_window, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole user story: export, edit + reorder in "Excel", import, Ctrl+Z."""
+    window = make_window()
+    spd = tmp_path / "mini.spd"
+    build_mini_spd(spd, style="si")
+    _load_via_thread(qapp, window, spd)
+
+    book = _export_xlsx(qapp, window, monkeypatch, tmp_path / "mini_tables.xlsx")
+    assert "Exported" in window.status_label.text()
+
+    # ... the user edits values on both sheets and drags the rows around.
+    xlsx_edit(book, "VRMs", vrm_key(POWER_NET_A), "Nominal V", 0.65)
+    xlsx_edit(book, "Sinks", sink_key(POWER_NET_B), "Current (A)", 9.5)
+    xlsx_rewrite(book, "VRMs", list(reversed(xlsx_rows(book, "VRMs"))))
+
+    before_undo = window.undo_stack.count()
+    _import_xlsx(window, monkeypatch, book)
+
+    assert window.undo_stack.count() == before_undo + 1  # ONE entry for both tables
+    assert window.session.vrm(POWER_NET_A).nominal_voltage == pytest.approx(0.65)
+    assert window.session.vrm(POWER_NET_A).nominal_override
+    assert window.session.sink(POWER_NET_B).current == pytest.approx(9.5)
+    status = window.status_label.text()
+    assert "Imported" in status and "2 cell(s)" in status
+
+    window.undo_stack.undo()  # one Ctrl+Z takes the entire import back
+    assert window.session.vrm(POWER_NET_A).nominal_voltage == pytest.approx(0.7)
+    assert not window.session.vrm(POWER_NET_A).nominal_override
+    assert window.session.sink(POWER_NET_B).current == pytest.approx(1.0)
+
+    window.undo_stack.redo()
+    assert window.session.vrm(POWER_NET_A).nominal_voltage == pytest.approx(0.65)
+    assert window.session.sink(POWER_NET_B).current == pytest.approx(9.5)
+
+
+def test_excel_import_of_a_tampered_workbook_changes_nothing(
+    qapp: QApplication, make_window, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    window = make_window()
+    spd = tmp_path / "mini.spd"
+    build_mini_spd(spd, style="si")
+    _load_via_thread(qapp, window, spd)
+
+    book = _export_xlsx(qapp, window, monkeypatch, tmp_path / "mini_tables.xlsx")
+    xlsx_edit(book, "VRMs", vrm_key(POWER_NET_A), "Nominal V", 0.65)  # good edit ...
+    xlsx_edit(book, "VRMs", vrm_key(POWER_NET_A), "Net", "RENAMED_RAIL/0")  # ... and a rename
+
+    shown: list[int] = []
+    monkeypatch.setattr(
+        MainWindow,
+        "_show_import_errors",
+        lambda self, path, report: shown.append(len(report.errors)),
+    )
+    _import_xlsx(window, monkeypatch, book)
+
+    assert shown == [1]  # the error dialog ran ...
+    assert window.undo_stack.count() == 0  # ... and nothing was pushed
+    assert window.session.vrm(POWER_NET_A).nominal_voltage == pytest.approx(0.7)
+
+
+def test_excel_import_can_be_cancelled_at_the_preview(
+    qapp: QApplication, make_window, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    window = make_window()
+    spd = tmp_path / "mini.spd"
+    build_mini_spd(spd, style="si")
+    _load_via_thread(qapp, window, spd)
+
+    book = _export_xlsx(qapp, window, monkeypatch, tmp_path / "mini_tables.xlsx")
+    xlsx_edit(book, "Sinks", sink_key(POWER_NET_A), "Current (A)", 5)
+    _import_xlsx(window, monkeypatch, book, confirm=False)
+
+    assert window.undo_stack.count() == 0
+    assert window.session.sink(POWER_NET_A).current == pytest.approx(1.0)
+    assert "cancelled" in window.status_label.text()
+
+
+def test_excel_actions_are_guarded_and_named(
+    qapp: QApplication, make_window, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    window = make_window()
+    titles = [action.text() for action in window.findChildren(QAction)]
+    assert "Export Excel…" in titles and "Import Excel…" in titles
+
+    # No file open yet: both must say so instead of opening a file dialog.
+    informed: list[str] = []
+    monkeypatch.setattr(
+        QMessageBox, "information", staticmethod(lambda *a, **k: informed.append(a[-1]))
+    )
+    monkeypatch.setattr(
+        QFileDialog,
+        "getSaveFileName",
+        staticmethod(lambda *a, **k: pytest.fail("no dialog without a scan")),
+    )
+    monkeypatch.setattr(
+        QFileDialog,
+        "getOpenFileName",
+        staticmethod(lambda *a, **k: pytest.fail("no dialog without a scan")),
+    )
+    window._export_xlsx()
+    window._import_xlsx()
+    assert len(informed) == 2
+
+    # ... and both are disabled while a worker runs (busy guard).
+    window._set_busy(True)
+    assert not window.export_xlsx_action.isEnabled()
+    assert not window.import_xlsx_action.isEnabled()
+    window._set_busy(False)
+
+
+def test_excel_export_default_filename_follows_the_spd(
+    qapp: QApplication, make_window, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    window = make_window()
+    spd = tmp_path / "board.spd"
+    build_mini_spd(spd, style="si")
+    _load_via_thread(qapp, window, spd)
+
+    seen: list[str] = []
+
+    def _capture(parent, caption, directory, *args, **kwargs):
+        seen.append(directory)
+        return "", ""
+
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", staticmethod(_capture))
+    window._export_xlsx()
+    assert seen == [str(tmp_path / "board_tables.xlsx")]
+
+
+def test_excel_import_that_changes_nothing_still_surfaces_its_warnings(
+    qapp: QApplication, make_window, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read-only cell the user edited is ignored -- and said so, not silently."""
+    window = make_window()
+    spd = tmp_path / "mini.spd"
+    build_mini_spd(spd, style="si")
+    _load_via_thread(qapp, window, spd)
+
+    book = _export_xlsx(qapp, window, monkeypatch, tmp_path / "mini_tables.xlsx")
+    xlsx_edit(book, "VRMs", vrm_key(POWER_NET_A), "Name", "MY_OWN_NAME")
+
+    warned: list[int] = []
+    monkeypatch.setattr(
+        MainWindow,
+        "_show_import_warnings",
+        lambda self, path, report: warned.append(len(report.warnings)),
+    )
+    _import_xlsx(window, monkeypatch, book)
+
+    assert warned == [1]
+    assert window.undo_stack.count() == 0
+    status = window.status_label.text()
+    assert "no changes" in status and "1 warning(s)" in status

@@ -14,13 +14,20 @@ Two tests, one shape:
 * `test_full_scale_pipeline` -- ~200 MB, the design §E numbers, `@slow`.
 
 Both drive the whole pipeline (`scan_spd` -> `Session` -> `build_plan` ->
-`write_spd`) **in a child process**, because `resource.getrusage` reports a
-process-wide high-water mark: measured in-process it would also count pytest,
-PySide6 and every other test module's imports, and could never be compared
-against a 256 MB budget. The child reports its own `ru_maxrss`, so the number
-this test asserts is the number the app would show on its own.
+`write_spd`) **in a child process**, because a peak-RSS high-water mark is
+process-wide: measured in-process it would also count pytest, PySide6 and every
+other test module's imports, and could never be compared against a 256 MB
+budget. The child reports its own peak, so the number this test asserts is the
+number the app would show on its own.
 
-`resource` is Unix-only; on Windows (where CI runs the non-slow selection) the
+That peak is read from ``/proc/self/status``'s ``VmHWM``, not from
+`resource.getrusage`. `subprocess` starts the child with fork()+exec(), and on
+Linux its ``ru_maxrss`` comes back carrying the **parent's** high-water mark --
+a hello-world child of a 400 MB parent reports 400 MB -- which silently turned
+the assertions below into a measurement of pytest's own memory, passing or
+failing depending on which test modules had run first. ``VmHWM`` is per-mm and
+therefore the honest number; `getrusage` stays as the fallback where `/proc` is
+absent. On Windows (where CI runs the non-slow selection) neither exists, the
 child reports `rss_kb = None` and only the timing assertions apply.
 """
 
@@ -80,11 +87,21 @@ _WORKER = textwrap.dedent(
     def monotonic(seen):
         return all(a[0] <= b[0] for a, b in zip(seen, seen[1:]))
 
-    try:
-        import resource
-        rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    except ImportError:            # Windows: no getrusage
-        rss_kb = None
+    rss_kb = None
+    try:                           # this process's own peak (see module docstring)
+        with open("/proc/self/status") as status:
+            for line in status:
+                if line.startswith("VmHWM:"):
+                    rss_kb = int(line.split()[1])
+                    break
+    except OSError:                # no /proc (Windows, some containers)
+        pass
+    if rss_kb is None:
+        try:
+            import resource
+            rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        except ImportError:        # Windows: no getrusage either
+            rss_kb = None
 
     with open(output, "rb") as handle:
         head = handle.read(4096)
@@ -192,6 +209,7 @@ def test_scaled_pipeline_sanity(tmp_path: Path) -> None:
 
 
 @pytest.mark.slow
+@pytest.mark.timeout(600)
 def test_full_scale_pipeline(tmp_path: Path) -> None:
     """design §E: 200 MB synthetic -- scan < 60 s, write < 120 s, RSS < 256 MB."""
     source = tmp_path / "big.spd"
@@ -224,6 +242,7 @@ def test_full_scale_pipeline(tmp_path: Path) -> None:
 
 
 @pytest.mark.slow
+@pytest.mark.timeout(600)
 def test_full_scale_crlf_input_yields_lf_only_contiguous_output(tmp_path: Path) -> None:
     """design §G.6 (LF-only output) and §D step 5 (no blank line between blocks),
     on a 200 MB **CRLF** input.

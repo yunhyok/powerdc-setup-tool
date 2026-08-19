@@ -86,7 +86,7 @@ def test_iss_defines_app_metadata_and_fresh_appid() -> None:
     assert NEW_APP_APPID in iss
     # Must not reuse the old app's installer identity.
     assert OLD_APP_APPID not in iss
-    assert "MyAppVersion" in iss and '"0.1.2"' in iss
+    assert "MyAppVersion" in iss and '"0.1.4"' in iss
     assert "SPD Manipulator for PowerDC" in iss  # DefaultDirName / Files source
     assert "desktopicon" in iss
     assert "Compression=lzma" in iss
@@ -235,10 +235,16 @@ def test_pyproject_matches_package_name_script_and_version() -> None:
     project = pyproject["project"]
 
     assert project["name"] == "powerdc-setup-tool"
-    assert project["version"] == "0.1.2"
+    assert project["version"] == "0.1.4"
 
     scripts = project.get("scripts", {})
     assert scripts.get("powerdc-setup-tool") == "powerdc_setup_tool.app:main"
+
+    # v0.1.4 `core/xlsx_io.py` reads and writes the .xlsx round trip; it is a
+    # runtime dependency, not a dev one, and the PyInstaller bundle needs it.
+    requires = " ".join(project.get("dependencies", []))
+    assert "PySide6" in requires
+    assert "openpyxl" in requires
 
     init_text = _read("src/powerdc_setup_tool/__init__.py")
     match = re.search(r'__version__\s*=\s*"([^"]+)"', init_text)
@@ -270,6 +276,16 @@ def test_readme_carries_the_current_version_changelog() -> None:
     readme = _read("README.md")
 
     assert f"## v{version}" in readme
-    # v0.1.2's five headline items.
-    for phrase in ("sort", "Check all", "Paired GND", "Auto-classif", "Source"):
+    # v0.1.4's headline items, plus the usage section they need.
+    for phrase in (
+        "Excel round trip",
+        "Export Excel",
+        "Import Excel",
+        "all-or-nothing",
+        "`Key`",
+        "reorder the rows freely",
+    ):
+        assert phrase in readme, phrase
+    # ... and the older sections stay in the changelog.
+    for phrase in ("## v0.1.2", "## v0.1.1", "Paired GND", "Auto-classif"):
         assert phrase in readme, phrase

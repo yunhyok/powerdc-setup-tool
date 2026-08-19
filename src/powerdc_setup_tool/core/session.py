@@ -645,6 +645,15 @@ class Session:
         """
         return [n for n in self._ordered_nets() if self.nets[n].net_class == CLASS_GROUND]
 
+    def circuit_names(self) -> list[str]:
+        """Every scanned circuit -- the Component column's value domain (§G.3).
+
+        Public since v0.1.4: `ui/models.py` fills the Component combo from it
+        and `core/xlsx_io.py` validates an imported Component cell against it,
+        so both have to mean the same thing.
+        """
+        return self._circuit_names()
+
     def class_source(self, net: str) -> str:
         """v0.1.2 *Source* column: ``"input"``/``"auto"``/``"user"``/``""``."""
         cfg = self.nets.get(net)

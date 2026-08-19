@@ -2,8 +2,15 @@
 
 1400x860 (min 1100x700). Toolbar: Open SPD (Ctrl+O) / Rescan (F5) /
 Auto-classify / Export DC SPD (Ctrl+E) / Save Config (Ctrl+S) / Load Config
-(Ctrl+L) / Undo/Redo (Ctrl+Z/Y). `QTabWidget`: Net Manager | VRMs | Sinks.
-Status bar: message label / counts label / `QProgressBar`.
+(Ctrl+L) / Export Excel… / Import Excel… / Undo/Redo (Ctrl+Z/Y). `QTabWidget`:
+Net Manager | VRMs | Sinks. Status bar: message label / counts label /
+`QProgressBar`.
+
+v0.1.4 adds the two Excel entries around `core/xlsx_io.py`. Import is the
+interesting one: `import_tables` validates the whole workbook without touching
+the `Session`, so the window either shows every problem and applies nothing, or
+shows how many cells would move and pushes them as one `CompositeEditCommand`
+-- a single Ctrl+Z, even though the edits span two tables.
 
 Worker lifecycle follows the sibling `spd-model-injector` app's pattern
 verbatim-in-spirit (see `old_repo_brief.md`): the `QThread`/worker pair is
@@ -33,6 +40,7 @@ event and re-issues it from the thread's own `finished` signal.
 from __future__ import annotations
 
 from collections.abc import Iterable
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QThread, Qt
@@ -54,11 +62,13 @@ from PySide6.QtWidgets import (
     QToolBar,
 )
 
+from powerdc_setup_tool.core import xlsx_io
 from powerdc_setup_tool.core.model import ScanResult, ValidationIssue
-from powerdc_setup_tool.core.session import Session
+from powerdc_setup_tool.core.session import Session, split_key
 from powerdc_setup_tool.core.writer import WritePlan
 from powerdc_setup_tool.ui.net_manager import NetManagerTab
 from powerdc_setup_tool.ui.sink_tab import SinkTab
+from powerdc_setup_tool.ui.table_view import BulkEditCommand, CompositeEditCommand
 from powerdc_setup_tool.ui.vrm_tab import VrmTab
 from powerdc_setup_tool.ui.workers import ExportWorker, ScanWorker
 
@@ -172,6 +182,23 @@ class MainWindow(QMainWindow):
 
         toolbar.addSeparator()
 
+        # v0.1.4: the VRM/Sink tables as a spreadsheet, out and back in.
+        self.export_xlsx_action = QAction("Export Excel…", self)
+        self.export_xlsx_action.setToolTip(
+            "Write the VRM and Sink tables to an .xlsx workbook for editing in Excel"
+        )
+        self.export_xlsx_action.triggered.connect(self._export_xlsx)
+        toolbar.addAction(self.export_xlsx_action)
+
+        self.import_xlsx_action = QAction("Import Excel…", self)
+        self.import_xlsx_action.setToolTip(
+            "Read an edited .xlsx back in (rows may be reordered; net names may not change)"
+        )
+        self.import_xlsx_action.triggered.connect(self._import_xlsx)
+        toolbar.addAction(self.import_xlsx_action)
+
+        toolbar.addSeparator()
+
         self.undo_action = self.undo_stack.createUndoAction(self, "Undo")
         self.undo_action.setShortcut(QKeySequence("Ctrl+Z"))
         self.redo_action = self.undo_stack.createRedoAction(self, "Redo")
@@ -234,6 +261,8 @@ class MainWindow(QMainWindow):
             self.export_action,
             self.save_config_action,
             self.load_config_action,
+            self.export_xlsx_action,
+            self.import_xlsx_action,
         ):
             action.setEnabled(not busy)
         self.tabs.setEnabled(not busy)
@@ -667,6 +696,158 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"Loaded config from {Path(path).name}")
 
     # ------------------------------------------------------------------ #
+    # Excel round trip (v0.1.4)
+    # ------------------------------------------------------------------ #
+
+    def _export_xlsx(self) -> None:
+        """`core/xlsx_io.export_tables` to a user-chosen `.xlsx`."""
+        if self._busy:
+            return
+        if self.session.scan is None:
+            QMessageBox.information(self, APP_TITLE, "Open a .spd file first.")
+            return
+        default = ""
+        if self.spd_path is not None:
+            default = str(self.spd_path.with_name(f"{self.spd_path.stem}_tables.xlsx"))
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Excel", default, "Excel workbook (*.xlsx);;All files (*)"
+        )
+        if not path:
+            return
+        try:
+            xlsx_io.export_tables(
+                self.session,
+                path,
+                exported_at=datetime.now().isoformat(timespec="seconds"),
+            )
+        except OSError as exc:
+            self._show_error("Export Excel", f"Could not write {path}: {exc}")
+            return
+        # Every row is written, checked or not (`Use` is just another column),
+        # so this counts the tables -- not `counts()`, which counts enabled rows.
+        vrms, sinks = len(self.session.vrm_rows), len(self.session.sink_rows)
+        self.status_label.setText(
+            f"Exported {vrms} VRM + {sinks} Sink rows to {Path(path).name}"
+        )
+
+    def _import_xlsx(self) -> None:
+        """Parse an edited workbook, then apply it as one undoable step.
+
+        Nothing reaches the `Session` until `import_tables` comes back clean:
+        the file is validated as a whole (design: all-or-nothing), the user
+        confirms the cell count, and the edits are pushed as a single
+        `CompositeEditCommand` so one Ctrl+Z takes the entire import back.
+        """
+        if self._busy:
+            return
+        if self.session.scan is None:
+            QMessageBox.information(self, APP_TITLE, "Open a .spd file first.")
+            return
+        start_dir = str(self.spd_path.parent) if self.spd_path else ""
+        path_str, _ = QFileDialog.getOpenFileName(
+            self, "Import Excel", start_dir, "Excel workbook (*.xlsx);;All files (*)"
+        )
+        if not path_str:
+            return
+        path = Path(path_str)
+        try:
+            report = xlsx_io.import_tables(self.session, path)
+        except OSError as exc:
+            self._show_error("Import Excel", f"Could not read {path}: {exc}")
+            return
+
+        if report.errors:
+            self._show_import_errors(path, report)
+            return
+        if not report.applied_changes:
+            # Nothing to confirm -- but "nothing changed" plus a warning about an
+            # edit that was ignored is exactly the case the user needs to read.
+            if report.warnings:
+                self._show_import_warnings(path, report)
+            self._show_import_result(path, report, applied=0)
+            return
+        if not self._confirm_import(path, report):
+            self.status_label.setText(f"Import of {path.name} cancelled.")
+            return
+        applied = self._apply_import(report)
+        self._show_import_result(path, report, applied=applied)
+
+    def _show_import_errors(self, path: Path, report: xlsx_io.ImportReport) -> None:
+        """The blocking dialog: what is wrong, cell by cell, nothing applied."""
+        box = QMessageBox(self)
+        box.setWindowTitle("Import Excel")
+        box.setIcon(QMessageBox.Icon.Critical)
+        box.setText(
+            f"{path.name} cannot be imported: {len(report.errors)} problem(s) found.\n"
+            "No changes were applied."
+        )
+        box.setDetailedText("\n".join((*report.errors, *report.warnings)))
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        box.exec()
+
+    def _show_import_warnings(self, path: Path, report: xlsx_io.ImportReport) -> None:
+        """Warnings on an import that changes nothing (no preview dialog runs)."""
+        box = QMessageBox(self)
+        box.setWindowTitle("Import Excel")
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText(
+            f"{path.name} changes nothing in the tables, "
+            f"but {len(report.warnings)} thing(s) were ignored."
+        )
+        box.setDetailedText("\n".join(report.warnings))
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        box.exec()
+
+    def _confirm_import(self, path: Path, report: xlsx_io.ImportReport) -> bool:
+        """Preview dialog: how much would change, plus any warnings."""
+        box = QMessageBox(self)
+        box.setWindowTitle("Import Excel")
+        box.setIcon(QMessageBox.Icon.Warning if report.warnings else QMessageBox.Icon.Question)
+        box.setText(_import_summary(path, report))
+        if report.warnings:
+            box.setDetailedText("\n".join(report.warnings))
+        apply_button = box.addButton("Apply", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(apply_button)
+        box.exec()
+        return box.buttonRole(box.clickedButton()) == QMessageBox.ButtonRole.AcceptRole
+
+    def _apply_import(self, report: xlsx_io.ImportReport) -> int:
+        """Push the report onto the shared undo stack as **one** command."""
+        commands: list[BulkEditCommand] = []
+        for tab, kind in ((self.vrm_tab, "vrm"), (self.sink_tab, "sink")):
+            model = tab.model
+            changes: list[tuple[object, object, object]] = []
+            for row_key, field, old, new in report.applied_changes:
+                if split_key(row_key)[0] != kind:
+                    continue
+                index = model.index_for_key(row_key, model.column_index(field))
+                if index.isValid():
+                    changes.append((index, old, new))
+            if changes:
+                commands.append(BulkEditCommand(model, changes, text="Import Excel"))
+        cells = sum(command.cellCount() for command in commands)
+        if not cells:
+            return 0
+        self.undo_stack.push(CompositeEditCommand(f"Import Excel ({cells} cells)", commands))
+        self._update_status_counts()
+        return cells
+
+    def _show_import_result(
+        self, path: Path, report: xlsx_io.ImportReport, *, applied: int
+    ) -> None:
+        if applied:
+            message = (
+                f"Imported {path.name}: {applied} cell(s) across {report.row_count} row(s) "
+                f"({report.vrm_row_count} VRM, {report.sink_row_count} Sink)"
+            )
+        else:
+            message = f"Imported {path.name}: no changes -- the tables already match"
+        if report.warnings:
+            message += f" · {len(report.warnings)} warning(s)"
+        self.status_label.setText(message)
+
+    # ------------------------------------------------------------------ #
     # Cross-tab navigation / status bar
     # ------------------------------------------------------------------ #
 
@@ -749,6 +930,18 @@ def _load_summary(nets: int, power: int, ground: int) -> str:
     if parts:
         text += " · auto-classified " + " ".join(parts)
     return text
+
+
+def _import_summary(path: Path, report: xlsx_io.ImportReport) -> str:
+    """Preview-dialog text: how much of the session the workbook would move."""
+    text = (
+        f"{path.name} is valid.\n\n"
+        f"{report.cell_count} cell(s) will change across {report.row_count} row(s) "
+        f"({report.vrm_row_count} VRM, {report.sink_row_count} Sink)."
+    )
+    if report.warnings:
+        text += f"\n\n{len(report.warnings)} warning(s) -- see details."
+    return text + "\n\nApply?"
 
 
 def _format_issues(issues: Iterable[ValidationIssue]) -> str:
