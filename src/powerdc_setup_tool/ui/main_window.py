@@ -35,6 +35,41 @@ when that happens. Both workers therefore own a `threading.Event` cancel hook
 (`scan_spd`'s and `write_spd`'s `cancel` parameter); closing sets both, quits
 and waits, and if a thread *still* has not wound down it ignores the close
 event and re-issues it from the thread's own `finished` signal.
+
+v0.1.5 (Windows fatal exception on Rescan)
+------------------------------------------
+Starting a second scan used to free the *first* scan's worker twice. The worker
+has two independent owners: Python (the ``self._scan_worker`` strong ref this
+docstring demands) and Qt (``self._scan_thread.finished`` -> ``deleteLater``).
+`_load_spd` rebound ``self._scan_worker`` to the new worker, which dropped the
+last Python reference to the old one and had CPython destroy its `SbkObject`
+**on the GUI thread** -- while the old worker thread was still draining its own
+event queue and about to deliver the queued `DeferredDelete` for that very
+object. The second delete lands in freed memory and the process dies inside
+``Shiboken::Object::destroy`` (verified under gdb on Linux; on Windows it
+surfaced as a *Windows fatal exception* faulthandler dump).
+
+The window between the two owners opens because `_busy` is cleared at the end
+of `_on_scan_finished`, which runs *before* `finished` -> `quit` -> `finished`
+-> `deleteLater`/`_clear_scan_refs` has made its way back through both threads.
+Any Rescan issued in that window -- which is exactly what a user pressing F5,
+and `test_rescan_reloads_from_disk`, do -- races it. Whether the race is lost
+is pure thread-scheduling luck, which is why the same code passed on Linux and
+on three earlier Windows builds and then died on the fourth.
+
+`_retire_worker` closes it: the outgoing thread/worker pair is detached and
+`quit()`/`wait()`-ed *before* the new pair is built, and `QThread.wait` returns
+only once the thread has run its own `DeferredDelete` pass -- so Qt's delete has
+already happened and dropping the Python reference frees nothing but an already
+invalid wrapper. A pair that will not wind down inside the wait is parked
+(`_retired_workers`) rather than freed under a live thread: leaking one worker
+beats corrupting the heap.
+
+**Every** site that lets go of a worker reference now goes through it --
+`_load_spd`, `_start_export`, `_clear_scan_refs`, `_clear_export_refs` and
+`closeEvent`. That is the invariant: this window never assigns ``None`` over a
+live worker reference, because the only safe moment to drop one is after
+`QThread.wait` has confirmed Qt is finished with it.
 """
 
 from __future__ import annotations
@@ -43,7 +78,7 @@ from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QThread, Qt
+from PySide6.QtCore import QObject, QThread, Qt
 from PySide6.QtGui import QAction, QCloseEvent, QKeySequence, QUndoStack
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -61,6 +96,7 @@ from PySide6.QtWidgets import (
     QWidget,
     QToolBar,
 )
+from shiboken6 import Shiboken
 
 from powerdc_setup_tool.core import xlsx_io
 from powerdc_setup_tool.core.model import ScanResult, ValidationIssue
@@ -79,6 +115,26 @@ APP_TITLE = "SPD Manipulator for PowerDC"
 #: How long `closeEvent` blocks on each worker thread before giving up on a
 #: synchronous close and retrying from the thread's `finished` signal instead.
 CLOSE_WAIT_MS = 5000
+
+#: How long `_retire_worker` blocks on the *previous* worker thread before
+#: starting a new one (v0.1.5). This is not a scan: the run it waits on has
+#: already emitted `finished`/`failed`, so all that is left is the thread's
+#: event loop unwinding, which takes microseconds. The budget only exists so a
+#: pathological case parks the pair instead of hanging the GUI.
+RETIRE_WAIT_MS = 5000
+
+
+def qt_alive(obj: QObject | None) -> bool:
+    """True if *obj* is a QObject whose C++ side is still there.
+
+    v0.1.5 hygiene. A `deleteLater` scheduled on a worker thread can destroy the
+    C++ half of an object this window still holds a Python reference to, and
+    touching it then raises `RuntimeError` at best and dereferences freed memory
+    at worst. `shiboken6.Shiboken.isValid` is the supported way to ask.
+    """
+    if obj is None:
+        return False
+    return bool(Shiboken.isValid(obj))
 
 
 class MainWindow(QMainWindow):
@@ -105,6 +161,10 @@ class MainWindow(QMainWindow):
         self._export_worker: ExportWorker | None = None
         # Threads whose `finished` already re-triggers the deferred close.
         self._close_watched: list[QThread] = []
+        # v0.1.5: worker/thread pairs that would not wind down inside
+        # `RETIRE_WAIT_MS`. Held for the window's lifetime on purpose -- see
+        # `_retire_worker`; a leaked QObject is survivable, a double free is not.
+        self._retired_workers: list[tuple[QThread | None, QObject | None]] = []
 
         self.undo_stack = QUndoStack(self)
 
@@ -267,17 +327,81 @@ class MainWindow(QMainWindow):
             action.setEnabled(not busy)
         self.tabs.setEnabled(not busy)
 
+    def _drain_retired_workers(self) -> None:
+        """Let go of parked pairs whose thread has since wound down (v0.1.5).
+
+        `QThread.wait(0)` answers "has it finished?" without blocking, and a
+        thread that has finished has already run its finishing `DeferredDelete`
+        pass -- so Qt is done with the worker and this window's reference is the
+        only thing keeping an already-invalid wrapper alive.
+        """
+        self._retired_workers = [
+            (thread, worker)
+            for thread, worker in self._retired_workers
+            if qt_alive(thread) and not thread.wait(0)
+        ]
+
+    def _retire_worker(self, kind: str, *, wait_ms: int | None = None) -> None:
+        """Wind the previous *kind* (``"scan"``/``"export"``) worker pair down.
+
+        **This is the v0.1.5 crash fix** -- see the module docstring for the
+        full mechanism. In one sentence: the worker is owned by Python *and* by
+        Qt, so the old pair has to be gone from Qt's side before this window
+        lets go of its Python reference, or both owners free the same
+        `SbkObject` and the process dies inside ``Shiboken::Object::destroy``.
+
+        Called at the top of `_load_spd`/`_start_export`, i.e. only ever with a
+        run that has already emitted `finished`/`failed` (both call sites bail
+        out on `self._busy`), so the `wait()` here is the thread's event loop
+        unwinding and not the scan itself.
+
+        `QThread.wait` returning is the guarantee that matters: the thread runs
+        its pending `DeferredDelete` events on its way out, so the worker's C++
+        half is destroyed before this returns and the reference this method
+        drops is already nothing but an invalid wrapper.
+        """
+        self._drain_retired_workers()
+        thread: QThread | None = getattr(self, f"_{kind}_thread")
+        worker: QObject | None = getattr(self, f"_{kind}_worker")
+        setattr(self, f"_{kind}_thread", None)
+        setattr(self, f"_{kind}_worker", None)
+        if thread is None and worker is None:
+            return
+
+        if qt_alive(thread):
+            thread.quit()
+            # Note `isRunning()` is deliberately *not* consulted: a thread that
+            # has left its event loop but not yet finished reports False while
+            # still holding a queued DeferredDelete for the worker. `wait()` on
+            # an already-finished thread returns True immediately anyway.
+            if not thread.wait(RETIRE_WAIT_MS if wait_ms is None else wait_ms):
+                # Still alive after the budget: parking the pair leaks two
+                # QObjects, freeing it corrupts the heap. Park it.
+                self._retired_workers.append((thread, worker))
+                return
+        # Both halves are Qt-dead now; letting Python drop them is safe.
+
     def _clear_scan_refs(self) -> None:
-        # Guard on sender(): if a new scan started before this queued slot
-        # ran, the refs already point at the new thread/worker.
+        """Release the scan pair once its thread has wound down.
+
+        Guard on `sender()`: if a new scan started before this queued slot ran,
+        the refs already point at the new thread/worker and must be left alone.
+
+        v0.1.5: goes through `_retire_worker` instead of assigning ``None``
+        here. This slot reaches the GUI thread from the worker thread's
+        `finished`, which is *also* what triggers the worker's `deleteLater` --
+        so a plain ``self._scan_worker = None`` drops the last Python reference
+        while that `DeferredDelete` is still sitting in the worker thread's
+        queue, and both owners free the same object. That is the same defect as
+        the Rescan crash, on the path that runs after **every** scan.
+        """
         if self.sender() is self._scan_thread:
-            self._scan_thread = None
-            self._scan_worker = None
+            self._retire_worker("scan")
 
     def _clear_export_refs(self) -> None:
+        """Release the export pair once its thread has wound down (see above)."""
         if self.sender() is self._export_thread:
-            self._export_thread = None
-            self._export_worker = None
+            self._retire_worker("export")
 
     def _cancel_running_workers(self) -> None:
         """Set both workers' cancel events, so a long run unwinds promptly.
@@ -294,6 +418,9 @@ class MainWindow(QMainWindow):
             if worker is None:
                 continue
             setattr(self, flag, True)
+            if not qt_alive(worker):
+                # v0.1.5: ask shiboken first rather than find out by raising.
+                continue
             try:
                 worker.cancel()
             except RuntimeError:
@@ -304,11 +431,13 @@ class MainWindow(QMainWindow):
                 pass
 
     def _running_worker_threads(self) -> list[QThread]:
-        return [
-            thread
-            for thread in (self._scan_thread, self._export_thread)
-            if thread is not None and thread.isRunning()
+        threads = [
+            *(self._scan_thread, self._export_thread),
+            # A parked pair still owns a live thread -- `closeEvent` has to wait
+            # on it too, or it destroys the window out from under one (v0.1.5).
+            *(thread for thread, _worker in self._retired_workers),
         ]
+        return [thread for thread in threads if qt_alive(thread) and thread.isRunning()]
 
     def closeEvent(self, event: QCloseEvent) -> None:
         """Cancel + quit + wait any running worker thread before accepting.
@@ -321,9 +450,15 @@ class MainWindow(QMainWindow):
         """
         self._closing = True
         self._cancel_running_workers()
-        for thread in self._running_worker_threads():
-            thread.quit()
-            thread.wait(CLOSE_WAIT_MS)
+        # v0.1.5: retire both pairs outright instead of quitting only the
+        # threads that still report `isRunning()`. One that has just left its
+        # event loop but has not yet run its finishing `DeferredDelete` pass
+        # reports False there, and tearing the window's widget tree down on top
+        # of that races the worker thread's own teardown -- the crash lands in
+        # `QObject::~QObject` on the worker thread instead of on Rescan, but it
+        # is the same double-owner defect (see the module docstring).
+        for kind in ("scan", "export"):
+            self._retire_worker(kind, wait_ms=CLOSE_WAIT_MS)
 
         pending = self._running_worker_threads()
         if pending:
@@ -369,6 +504,11 @@ class MainWindow(QMainWindow):
     def _load_spd(self, path: Path) -> None:
         if self._busy:
             return
+        # v0.1.5: the previous scan's pair goes first, and goes *completely*.
+        # Rebinding `self._scan_worker` below would otherwise drop the last
+        # Python reference to a worker whose thread still has a queued
+        # `DeferredDelete` for it -- the Rescan crash (see module docstring).
+        self._retire_worker("scan")
         self._scan_cancel_requested = False
         self._pending_spd_path = Path(path)
         self.status_label.setText(f"Scanning {self._pending_spd_path.name}…")
@@ -413,7 +553,21 @@ class MainWindow(QMainWindow):
         ``"none"``, so a file-provided classification is filled *around*, never
         overwritten. Pairing stays at ``force=False`` for the same reason -- a
         ground the input file already paired survives the load.
+
+        v0.1.5 pins the teardown order. The undo stack is emptied **before**
+        `Session.load` replaces the rows, not after: its commands address the
+        outgoing session by row key, `clear()` emits `indexChanged` (wired to
+        `_on_model_changed`), and a command destructor or a slot on that signal
+        must never observe the half-swapped state where the session already
+        holds the new rows and the models still list the old ones. Cleared
+        first, the stack is empty for the whole swap and nothing can re-enter
+        it; the models are then reset once, at the end, against a settled
+        session.
         """
+        # 1. Nothing addressable by the old session may survive into the new one.
+        self.undo_stack.clear()
+        # 2. Swap the session's contents (the `Session` object itself, and so
+        #    the models' weak registry keyed on it, deliberately stays put).
         self.spd_path = self._pending_spd_path
         self._pending_spd_path = None
         self.session.load(result)
@@ -422,10 +576,7 @@ class MainWindow(QMainWindow):
         self.session.autopair(force=False)
         self.session.derive_all()
         after = self.session.counts()
-        # The stack's commands hold row/column keys into the *previous* session;
-        # redoing one after a fresh scan would write a stale edit onto a net
-        # that may not even exist any more (design §C: one shared stack).
-        self.undo_stack.clear()
+        # 3. One reset per model, against a session that has stopped moving.
         self._refresh_all_models()
         self.progress_bar.setVisible(False)
         self._set_busy(False)
@@ -574,6 +725,8 @@ class MainWindow(QMainWindow):
 
     def _start_export(self, output_path: Path, plan: WritePlan) -> None:
         assert self.session.scan is not None
+        # v0.1.5: same double-owner hazard as `_load_spd` -- retire first.
+        self._retire_worker("export")
         self._export_cancel_requested = False
         self.status_label.setText(f"Exporting to {output_path.name}…")
         self.progress_bar.setRange(0, 100)

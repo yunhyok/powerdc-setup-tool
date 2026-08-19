@@ -86,7 +86,7 @@ def test_iss_defines_app_metadata_and_fresh_appid() -> None:
     assert NEW_APP_APPID in iss
     # Must not reuse the old app's installer identity.
     assert OLD_APP_APPID not in iss
-    assert "MyAppVersion" in iss and '"0.1.4"' in iss
+    assert "MyAppVersion" in iss and '"0.1.5"' in iss
     assert "SPD Manipulator for PowerDC" in iss  # DefaultDirName / Files source
     assert "desktopicon" in iss
     assert "Compression=lzma" in iss
@@ -261,7 +261,7 @@ def test_pyproject_matches_package_name_script_and_version() -> None:
     project = pyproject["project"]
 
     assert project["name"] == "powerdc-setup-tool"
-    assert project["version"] == "0.1.4"
+    assert project["version"] == "0.1.5"
 
     scripts = project.get("scripts", {})
     assert scripts.get("powerdc-setup-tool") == "powerdc_setup_tool.app:main"
@@ -302,7 +302,10 @@ def test_readme_carries_the_current_version_changelog() -> None:
     readme = _read("README.md")
 
     assert f"## v{version}" in readme
-    # v0.1.4's headline items, plus the usage section they need.
+    # v0.1.5's headline item (the Windows-crash maintenance release).
+    for phrase in ("Windows crash fix on rescan", "owned twice", "one owner"):
+        assert phrase in readme, phrase
+    # v0.1.4's headline items, plus the usage section they need, stay below it.
     for phrase in (
         "Excel round trip",
         "Export Excel",

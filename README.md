@@ -7,6 +7,23 @@ Sigrity PowerSI `.spd` design for PowerDC (DCR) analysis: classify nets, pair po
 return (ground) nets, set per-net voltages, and generate the `.VRM` / `.Sink` blocks PowerDC
 expects -- then stream out a new `.spd` file, leaving the original untouched.
 
+## v0.1.5
+
+Maintenance release: v0.1.4 built fine locally but its Windows job crashed the test run outright
+(a *Windows fatal exception*, not a test failure), so no v0.1.4 installer was published. Behaviour
+is unchanged from v0.1.4 apart from the fix below.
+
+- **Windows crash fix on rescan** -- pressing *Rescan* (F5), or opening another `.spd` without
+  restarting, could kill the application outright with no error message and nothing in the log. The
+  background scan's worker was owned twice over -- by the window and by Qt's own deferred deletion
+  -- and starting the next scan could let both of them free it, which corrupts the process's own
+  memory. Whether that actually happened came down to thread timing, so the same build could run
+  for weeks on one machine and die on the first rescan on another; on the Windows CI runner it was
+  reliable enough to abort the whole test run. The window now waits for a scan thread to finish
+  before letting go of its worker, so there is only ever one owner. The same fix covers the export
+  worker, closing the window while a scan or export is still winding down, and the cleanup that
+  runs after **every** scan -- not only a rescan.
+
 ## v0.1.4
 
 - **Excel round trip for the VRM and Sink tables** -- *Export Excel…* writes both tables to one

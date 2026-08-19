@@ -31,7 +31,7 @@ from collections.abc import Callable, Iterator  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 import pytest  # noqa: E402
-from PySide6.QtCore import Qt  # noqa: E402
+from PySide6.QtCore import QCoreApplication, QEvent, Qt  # noqa: E402
 from PySide6.QtGui import QAction, QUndoStack  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication,
@@ -288,6 +288,104 @@ def test_rescan_reloads_from_disk(qapp: QApplication, make_window, tmp_path: Pat
     # a fresh scan resets the session (edits do not survive a rescan).
     assert window.session.nets[POWER_NET_A].voltage != 42.0
     assert len(window.session.nets) == first_net_count
+
+
+def _flush_deferred_deletes(app: QApplication, rounds: int = 6) -> None:
+    """Pump the loop *and* force `deleteLater` delivery on this thread.
+
+    `processEvents` alone does not necessarily run `DeferredDelete`, so a
+    lifetime bug can sit latent until Qt happens to collect. Sending the events
+    explicitly makes the collection happen now, at a point the test controls --
+    which is what turns the v0.1.5 Windows crash into a reproducible Linux
+    segfault instead of a once-in-a-while CI failure.
+    """
+    for _ in range(rounds):
+        app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        app.processEvents()
+
+
+def test_rescan_never_frees_the_previous_scan_worker_twice(
+    qapp: QApplication, make_window, tmp_path: Path
+) -> None:
+    """Regression (v0.1.5): the Windows fatal exception on Rescan.
+
+    The scan worker has two owners -- `MainWindow._scan_worker` (Python) and the
+    `deleteLater` wired to its thread's `finished` (Qt). Rescanning used to
+    rebind the attribute while that `DeferredDelete` was still queued in the
+    worker thread, so both owners freed the same `SbkObject`: the process died
+    inside ``Shiboken::Object::destroy``/``QObject::~QObject`` on the worker
+    thread. `MainWindow` now releases a worker only after `QThread.wait` says Qt
+    is done with it.
+
+    Rescans deliberately wait only on `_busy` -- not on the thread refs
+    clearing -- because `_busy` is exactly what gates the toolbar, so it is the
+    window a user pressing F5 twice actually hits.
+    """
+    window = make_window()
+    spd = tmp_path / "mini.spd"
+    build_mini_spd(spd, style="si")
+    _load_via_thread(qapp, window, spd)
+
+    for round_number in range(4):
+        window.session.set_net_voltage(POWER_NET_A, 40.0 + round_number)
+        window._rescan()
+        _spin_until(qapp, lambda: not window._busy, timeout=15.0, what="rescan to finish")
+        # Forcing the deleted-object collection *here* is the whole point: it
+        # is what made the double free deterministic rather than scheduler luck.
+        _flush_deferred_deletes(qapp)
+        assert window.session.nets[POWER_NET_A].voltage != 40.0 + round_number
+
+    _spin_until(
+        qapp,
+        lambda: window._scan_thread is None and window._scan_worker is None,
+        timeout=15.0,
+        what="the last scan's refs to be released",
+    )
+    assert window._retired_workers == [], "no pair should have needed parking"
+
+
+def test_rescan_under_a_live_sort_with_an_excel_import_on_the_undo_stack(
+    qapp: QApplication, make_window, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The v0.1.5 crash proxy with every v0.1.4 moving part switched on.
+
+    Sorting active on all three tables (so each model reset re-runs the proxy's
+    comparator), a `CompositeEditCommand` from an Excel import on the shared
+    undo stack (so `undo_stack.clear()` destroys a multi-model command during
+    the session swap), and `DeferredDelete` forced after every step.
+    """
+    window = make_window()
+    spd = tmp_path / "mini.spd"
+    build_mini_spd(spd, style="si")
+    _load_via_thread(qapp, window, spd)
+
+    for tab, key in (
+        (window.net_tab, "voltage"),
+        (window.vrm_tab, "nominal_voltage"),
+        (window.sink_tab, "current"),
+    ):
+        tab.view.sortByColumn(tab.model.column_index(key), Qt.SortOrder.DescendingOrder)
+
+    book = _export_xlsx(qapp, window, monkeypatch, tmp_path / "mini_tables.xlsx")
+    xlsx_edit(book, "VRMs", vrm_key(POWER_NET_A), "Nominal V", 0.65)
+    xlsx_edit(book, "Sinks", sink_key(POWER_NET_B), "Current (A)", 9.5)
+    xlsx_rewrite(book, "VRMs", list(reversed(xlsx_rows(book, "VRMs"))))
+    _import_xlsx(window, monkeypatch, book)
+    assert window.undo_stack.count() == 1
+    _flush_deferred_deletes(qapp)
+
+    for round_number in range(3):
+        window.session.set_net_voltage(POWER_NET_A, 30.0 + round_number)
+        window._rescan()
+        _spin_until(qapp, lambda: not window._busy, timeout=15.0, what="rescan to finish")
+        _flush_deferred_deletes(qapp)
+        # the rescan drops the import with the rest of the stale history
+        assert window.undo_stack.count() == 0
+        # and every table is still live, sorted, and the right length
+        for tab in (window.net_tab, window.vrm_tab, window.sink_tab):
+            assert tab.view.isSortingEnabled()
+            assert tab.proxy.rowCount() == tab.model.rowCount()
 
 
 def test_scan_failure_shows_error_and_resets_busy_state(
@@ -1044,7 +1142,13 @@ def test_close_mid_scan_cancels_the_scan_and_accepts_the_close(
     assert window._scan_worker is not None
 
     assert window.close() is True, "the close must be accepted, not deferred"
-    assert not window._scan_thread.isRunning(), "the thread must be joined before teardown"
+    # v0.1.5: an accepted close joins the thread *and* lets go of the pair. It
+    # used to leave `_scan_thread`/`_scan_worker` set (merely not running); the
+    # worker is now released only once `QThread.wait` says Qt has finished with
+    # it, so "joined" and "released" are the same event.
+    assert window._scan_thread is None, "the thread must be joined and released"
+    assert window._scan_worker is None
+    assert window._retired_workers == [], "a joined pair must not stay parked"
 
     for _ in range(10):
         qapp.processEvents()
