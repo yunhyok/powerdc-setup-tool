@@ -54,6 +54,7 @@ from fixtures import (  # noqa: E402
 from powerdc_setup_tool.core.columns import SINK_COLUMNS, VRM_COLUMNS  # noqa: E402
 from powerdc_setup_tool.core.session import Session, sink_key, vrm_key  # noqa: E402
 from powerdc_setup_tool.core.spd_scan import ScanCancelled, scan_spd  # noqa: E402
+from powerdc_setup_tool.core.writer import WriteCancelled  # noqa: E402
 from powerdc_setup_tool.ui import main_window as main_window_mod  # noqa: E402
 from powerdc_setup_tool.ui import workers as workers_mod  # noqa: E402
 from powerdc_setup_tool.ui.main_window import APP_TITLE, MainWindow, _ExportOptionsDialog  # noqa: E402
@@ -507,9 +508,44 @@ def test_export_destination_guarded_against_the_source_path(
     assert not window._busy
 
 
+def _blocking_write(entered: threading.Event):
+    """A `write_spd` stand-in that stays inside the worker until cancelled.
+
+    The mini fixture exports in microseconds, so a *real* mid-export cancel is
+    unraceable: the write usually finishes before `_cancel_export` can land,
+    and the test then asserts a cancel against a *completed* export. This
+    stands in for the 1.4 GB file, where the write genuinely runs for tens of
+    seconds after the user hits Cancel.
+
+    It honours `core.writer`'s contract exactly, because that is what the UI
+    wiring under test is written against: the in-progress bytes live in
+    ``<output>.part``, and a cancel deletes that partial before letting
+    `WriteCancelled` out (design §G.8). The real writer's own cancel paths stay
+    covered against the real thing in `test_writer.py`.
+    """
+
+    def _write(scan, plan, output, progress=None, cancel=None):
+        assert cancel is not None, "ExportWorker must pass its cancel event to write_spd"
+        part = Path(output).with_name(Path(output).name + ".part")
+        part.write_bytes(b"partial export\n")  # what the real writer holds open
+        entered.set()
+        # the real `write_spd` polls this per chunk and per block
+        if not cancel.wait(15.0):
+            raise AssertionError("the Cancel button never set the export's cancel event")
+        # `write_spd` unlinks the partial in its `except BaseException` before
+        # re-raising; same order, so the UI sees the same post-cancel state.
+        part.unlink(missing_ok=True)
+        raise WriteCancelled("Export cancelled; the partial output was deleted.")
+
+    return _write
+
+
 def test_export_cancel_deletes_partial_output(
-    qapp: QApplication, make_window, tmp_path: Path
+    qapp: QApplication, make_window, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    entered = threading.Event()
+    monkeypatch.setattr(workers_mod, "write_spd", _blocking_write(entered))
+
     window = make_window()
     # `QWidget.isVisible()` reflects the whole ancestor chain, including the
     # top-level window -- without `show()` the button stays report-invisible
@@ -520,15 +556,22 @@ def test_export_cancel_deletes_partial_output(
     _load_via_thread(qapp, window, source)
 
     output_path = tmp_path / "in_DC.spd"
+    part_path = tmp_path / f"{output_path.name}.part"
     plan = window.session.build_plan({})
     window._start_export(output_path, plan)
     assert window.cancel_button.isVisible()
 
+    # Cancel only once the write is genuinely in flight, so this exercises the
+    # mid-export path rather than racing a finished one.
+    _spin_until(qapp, entered.is_set, timeout=15.0, what="the export to reach the worker thread")
+    assert part_path.exists(), "the partial the cancel has to clean up must exist first"
+
     window._cancel_export()
+    assert window._export_cancel_requested  # Cancel button -> worker's cancel event
     _spin_until(qapp, lambda: not window._busy, timeout=15.0, what="cancelled export to settle")
 
     assert not output_path.exists()
-    assert not (tmp_path / f"{output_path.name}.part").exists()
+    assert not part_path.exists()
     assert "cancel" in window.status_label.text().lower()
     assert not window.cancel_button.isVisible()
 
