@@ -79,7 +79,12 @@ from powerdc_setup_tool.ui.models import (
     source_index,
 )
 
-__all__ = ["BulkEditTableView", "BulkEditCommand", "RESET_TO_AUTO"]
+__all__ = [
+    "BulkEditTableView",
+    "BulkEditCommand",
+    "CompositeEditCommand",
+    "RESET_TO_AUTO",
+]
 
 
 class _ResetToAuto:
@@ -229,6 +234,42 @@ class BulkEditCommand(QUndoCommand):
                 if index.isValid():
                     self._model.setData(index, change.old, Qt.ItemDataRole.EditRole)
             self._reset_auto(resets)
+
+
+class CompositeEditCommand(QUndoCommand):
+    """One undo-stack entry spanning several tables (v0.1.4 Excel import).
+
+    An imported workbook moves VRM *and* Sink cells, and each `BulkEditCommand`
+    belongs to exactly one model, so the two are wrapped here: a single Ctrl+Z
+    takes the whole import back.
+
+    The children are held in a plain Python list and driven by hand rather than
+    handed to `QUndoCommand`'s ``parent`` argument. PySide does **not** transfer
+    ownership of a Python-side command to a C++ parent there, so the parent ends
+    up pointing at objects the garbage collector is still free to reclaim -- the
+    process then segfaults on the next redo/undo (reproduced on PySide6 6.11).
+    """
+
+    def __init__(self, text: str, commands: Iterable[QUndoCommand]) -> None:
+        super().__init__(text)
+        self._commands: list[QUndoCommand] = list(commands)
+
+    def commands(self) -> list[QUndoCommand]:
+        return list(self._commands)
+
+    def cellCount(self) -> int:
+        return sum(getattr(command, "cellCount", lambda: 0)() for command in self._commands)
+
+    def isEmpty(self) -> bool:
+        return not self._commands or self.cellCount() == 0
+
+    def redo(self) -> None:
+        for command in self._commands:
+            command.redo()
+
+    def undo(self) -> None:
+        for command in reversed(self._commands):
+            command.undo()
 
 
 class BulkEditTableView(QTableView):

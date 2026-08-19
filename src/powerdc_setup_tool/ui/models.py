@@ -24,6 +24,15 @@ it move -- or the row count move, the belt-and-braces check kept for sessions
 mutated outside the mutator API -- forces a full `refresh_from_session` reset
 instead of a cell patch.
 
+v0.1.4
+------
+* **`VrmTableModel`/`SinkTableModel` columns are built from `core/columns.py`**
+  (`_specs`): key, title, kind and editability come from the Qt-free manifest
+  that `core/xlsx_io.py` writes the spreadsheet from, so the GUI table and the
+  Excel round trip cannot drift apart. Everything Qt-only -- the derived
+  columns' getters, the combo choices, the ``*_override`` wiring -- is layered
+  on here. The kind constants are re-exported from that module too.
+
 v0.1.2
 ------
 * **Header-click sorting** (`ConfigSortProxy`, which `NetFilterProxy` now
@@ -75,6 +84,18 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QBrush, QColor, QFont
 
 from powerdc_setup_tool.core import naming
+from powerdc_setup_tool.core.columns import (
+    KIND_BOOL,
+    KIND_CURRENT,
+    KIND_ENUM,
+    KIND_INT,
+    KIND_TEXT,
+    KIND_VOLTAGE,
+    NUMERIC_KINDS,
+    SINK_COLUMNS,
+    VRM_COLUMNS,
+    ColumnDef,
+)
 from powerdc_setup_tool.core.model import PowerNetConfig, SinkConfig, VrmConfig
 from powerdc_setup_tool.core.session import (
     DEFAULT_CURRENT,
@@ -116,15 +137,9 @@ __all__ = [
 # Column kinds (design §C "kind" column of the three table specs)
 # --------------------------------------------------------------------------- #
 
-KIND_BOOL = "bool"
-KIND_TEXT = "text"
-KIND_ENUM = "enum"
-KIND_VOLTAGE = "voltage"
-KIND_CURRENT = "current"
-KIND_INT = "int"
-
-#: Kinds a `NumericDelegate` edits and a numeric parser accepts.
-NUMERIC_KINDS: tuple[str, ...] = (KIND_VOLTAGE, KIND_CURRENT, KIND_INT)
+# v0.1.4: the kinds and the VRM/Sink column manifest live in `core/columns.py`
+# so the Excel round trip writes the very columns these tables show. Re-exported
+# here because `ui.models.KIND_*` is what the delegates and tests import.
 
 #: Unit shown in the override tooltip ("auto value: 0.75 V"). Cell text itself
 #: stays unit-free -- the header carries the unit and TSV copy/paste round-trips.
@@ -226,12 +241,12 @@ def frozen_sorting(model: Any) -> Iterator[None]:
 
 
 def _circuit_names(session: Session) -> list[str]:
-    """Every scanned circuit -- the Component combo's model (design §G.3)."""
-    scan = session.scan
-    if scan is None:
-        return []
-    names = [info.name for info in scan.circuits]
-    return names or sorted(scan.pin_maps.by_circuit)
+    """Every scanned circuit -- the Component combo's model (design §G.3).
+
+    `Session.circuit_names()` since v0.1.4, so the combo and the Excel import's
+    Component check share one definition of "is that a real circuit?".
+    """
+    return session.circuit_names()
 
 
 def _ground_choices(field: str) -> Callable[[Session, Any], list[str]]:
@@ -390,6 +405,28 @@ class ColumnSpec:
         if self.kind in NUMERIC_KINDS:
             return format_number(value)
         return str(value)
+
+
+def _specs(
+    defs: Sequence[ColumnDef], extras: dict[str, dict[str, Any]]
+) -> tuple[ColumnSpec, ...]:
+    """`core/columns.py` manifest -> `ColumnSpec`s, plus this table's Qt wiring.
+
+    v0.1.4: key, title, kind and editability come from the manifest the Excel
+    export/import reads, so a column can only ever be renamed or reordered in
+    both places at once. *extras* adds what only the GUI has -- getters for the
+    derived columns, combo choices, the ``*_override`` flag a cell styles on.
+    """
+    return tuple(
+        ColumnSpec(
+            column.key,
+            column.title,
+            column.kind,
+            editable=column.editable,
+            **extras.get(column.key, {}),
+        )
+        for column in defs
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1014,70 +1051,37 @@ class VrmTableModel(BaseConfigModel):
     """design §C VRMs table (Name derived read-only, ``VRM_{comp}_{pnet}_{gnet}``)."""
 
     ROW_KIND = "vrm"
-    COLUMNS = (
-        ColumnSpec("enabled", "Use", KIND_BOOL, editable=True),
-        ColumnSpec("net", "Net", KIND_TEXT, getter=lambda _s, cfg, _k: cfg.net),
-        ColumnSpec(
-            "comp",
-            "Component",
-            KIND_ENUM,
-            editable=True,
-            choices=lambda session, _cfg: _circuit_names(session),
-            pinned=True,
-            auto_value=_auto_vrm_comp,
-        ),
-        ColumnSpec(
-            "gnet",
-            "Ground",
-            KIND_ENUM,
-            editable=True,
-            choices=_ground_choices("gnet"),
-            pinned=True,
-            auto_value=_auto_gnet,
-        ),
-        ColumnSpec(
-            "nominal_voltage",
-            "Nominal V",
-            KIND_VOLTAGE,
-            editable=True,
-            override_field="nominal_override",
-            auto_value=_net_voltage,
-        ),
-        ColumnSpec(
-            "sense_voltage",
-            "Sense V",
-            KIND_VOLTAGE,
-            editable=True,
-            override_field="sense_override",
-            # spec §9 `{v_sense}` = `{v_nom}` (see `Session`'s module docstring).
-            auto_value=lambda _s, cfg: cfg.nominal_voltage,
-        ),
-        ColumnSpec(
-            "output_current",
-            "Output Current (A)",
-            KIND_CURRENT,
-            editable=True,
-            override_field="current_override",
-            auto_value=lambda _s, _cfg: DEFAULT_CURRENT,
-        ),
-        ColumnSpec(
-            "pos_pins",
-            "Pos pins",
-            KIND_INT,
-            getter=lambda session, cfg, _k: len(session.positive_pins(cfg)),
-        ),
-        ColumnSpec(
-            "neg_pins",
-            "Neg pins",
-            KIND_INT,
-            getter=lambda session, cfg, _k: len(session.negative_pins(cfg)),
-        ),
-        ColumnSpec(
-            "name",
-            "Name",
-            KIND_TEXT,
-            getter=lambda session, _cfg, key: session.display_names().get(key, ""),
-        ),
+    COLUMNS = _specs(
+        VRM_COLUMNS,
+        {
+            "net": dict(getter=lambda _s, cfg, _k: cfg.net),
+            "comp": dict(
+                choices=lambda session, _cfg: _circuit_names(session),
+                pinned=True,
+                auto_value=_auto_vrm_comp,
+            ),
+            "gnet": dict(
+                choices=_ground_choices("gnet"),
+                pinned=True,
+                auto_value=_auto_gnet,
+            ),
+            "nominal_voltage": dict(
+                override_field="nominal_override",
+                auto_value=_net_voltage,
+            ),
+            "sense_voltage": dict(
+                override_field="sense_override",
+                # spec §9 `{v_sense}` = `{v_nom}` (see `Session`'s module docstring).
+                auto_value=lambda _s, cfg: cfg.nominal_voltage,
+            ),
+            "output_current": dict(
+                override_field="current_override",
+                auto_value=lambda _s, _cfg: DEFAULT_CURRENT,
+            ),
+            "pos_pins": dict(getter=lambda session, cfg, _k: len(session.positive_pins(cfg))),
+            "neg_pins": dict(getter=lambda session, cfg, _k: len(session.negative_pins(cfg))),
+            "name": dict(getter=lambda session, _cfg, key: session.display_names().get(key, "")),
+        },
     )
 
 
@@ -1085,64 +1089,32 @@ class SinkTableModel(BaseConfigModel):
     """design §C Sinks table; Model/PFMode/PinEqualCurrent are the advanced trio."""
 
     ROW_KIND = "sink"
-    COLUMNS = (
-        ColumnSpec("enabled", "Use", KIND_BOOL, editable=True),
-        ColumnSpec("net", "Net", KIND_TEXT, getter=lambda _s, cfg, _k: cfg.net),
-        ColumnSpec(
-            "comp",
-            "Component",
-            KIND_ENUM,
-            editable=True,
-            choices=lambda session, _cfg: _circuit_names(session),
-            pinned=True,
-            auto_value=_auto_sink_comp,
-        ),
-        ColumnSpec(
-            "gnet",
-            "Ground",
-            KIND_ENUM,
-            editable=True,
-            choices=_ground_choices("gnet"),
-            pinned=True,
-            auto_value=_auto_gnet,
-        ),
-        ColumnSpec(
-            "nominal_voltage",
-            "Nominal V",
-            KIND_VOLTAGE,
-            editable=True,
-            override_field="nominal_override",
-            auto_value=_net_voltage,
-        ),
-        ColumnSpec(
-            "current",
-            "Current (A)",
-            KIND_CURRENT,
-            editable=True,
-            override_field="current_override",
-            auto_value=lambda _s, _cfg: DEFAULT_CURRENT,
-        ),
-        ColumnSpec("model", "Model", KIND_INT, editable=True),
-        ColumnSpec("pf_mode", "PFMode", KIND_INT, editable=True),
-        ColumnSpec("pin_equal_current", "PinEqualCurrent", KIND_INT, editable=True),
-        ColumnSpec(
-            "pos_pins",
-            "Pos pins",
-            KIND_INT,
-            getter=lambda session, cfg, _k: len(session.positive_pins(cfg)),
-        ),
-        ColumnSpec(
-            "neg_pins",
-            "Neg pins",
-            KIND_INT,
-            getter=lambda session, cfg, _k: len(session.negative_pins(cfg)),
-        ),
-        ColumnSpec(
-            "name",
-            "Name",
-            KIND_TEXT,
-            getter=lambda session, _cfg, key: session.display_names().get(key, ""),
-        ),
+    COLUMNS = _specs(
+        SINK_COLUMNS,
+        {
+            "net": dict(getter=lambda _s, cfg, _k: cfg.net),
+            "comp": dict(
+                choices=lambda session, _cfg: _circuit_names(session),
+                pinned=True,
+                auto_value=_auto_sink_comp,
+            ),
+            "gnet": dict(
+                choices=_ground_choices("gnet"),
+                pinned=True,
+                auto_value=_auto_gnet,
+            ),
+            "nominal_voltage": dict(
+                override_field="nominal_override",
+                auto_value=_net_voltage,
+            ),
+            "current": dict(
+                override_field="current_override",
+                auto_value=lambda _s, _cfg: DEFAULT_CURRENT,
+            ),
+            "pos_pins": dict(getter=lambda session, cfg, _k: len(session.positive_pins(cfg))),
+            "neg_pins": dict(getter=lambda session, cfg, _k: len(session.negative_pins(cfg))),
+            "name": dict(getter=lambda session, _cfg, key: session.display_names().get(key, "")),
+        },
     )
 
     #: design §C: "hidden behind a *Show advanced* checkbox (defaults 2/2/1, §A3)".

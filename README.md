@@ -7,6 +7,20 @@ Sigrity PowerSI `.spd` design for PowerDC (DCR) analysis: classify nets, pair po
 return (ground) nets, set per-net voltages, and generate the `.VRM` / `.Sink` blocks PowerDC
 expects -- then stream out a new `.spd` file, leaving the original untouched.
 
+## v0.1.4
+
+- **Excel round trip for the VRM and Sink tables** -- *Export Excel…* writes both tables to one
+  `.xlsx` workbook (a **VRMs** sheet, a **Sinks** sheet and a hidden `_meta` sheet), and
+  *Import Excel…* reads an edited copy back in. Edit the values in Excel with formulas, fill-downs
+  and filters, sort or drag the rows into whatever order you like, then import: rows are matched by
+  their `Key` column, never by position. The import is **all-or-nothing** and lands as a single
+  undoable step -- one Ctrl+Z takes the whole workbook back out.
+- **Integrity checks on import** -- the `Key` and `Net` cells identify a channel and must not be
+  edited, and every column of the table has to still be there (matched by header title, in any
+  order). A renamed net, a duplicated or unknown `Key`, a missing column, a word in a number cell, a
+  voltage of 0 or less, a component that is not a circuit of the design, or a ground that is not a
+  classified ground net each block the *entire* import, listed cell by cell; nothing is applied.
+
 ## v0.1.3
 
 Maintenance release: v0.1.2 built and ran fine locally but its Windows release job never finished,
@@ -124,6 +138,29 @@ Requires Python 3.12+.
 4. **Export DC SPD** -- validate, pick an output path (never the source path), and write. Progress is
    shown while the new `.spd` streams to disk.
 
+### Excel round trip
+
+*Export Excel…* (default filename `<spd stem>_tables.xlsx`) writes the VRM and Sink tables to one
+workbook: a **VRMs** sheet, a **Sinks** sheet, and a hidden `_meta` sheet carrying the schema and
+app version. Each sheet holds a `Key` column followed by exactly the columns of the matching GUI
+table -- the editable ones (`Use`, `Component`, `Ground`, the voltages and currents, and the Sink's
+`Model` / `PFMode` / `PinEqualCurrent`) plus read-only context (`Net`, `Pos pins`, `Neg pins`,
+`Name`, shown greyed).
+
+Edit the values however you like and **reorder the rows freely** -- sorting or dragging rows changes
+nothing, because *Import Excel…* matches rows by their `Key`, not by position. What must stay intact
+is the identity and the shape of the table: **do not edit the `Key` or `Net` cells** (they name the
+channel), and do not remove or rename columns; extra columns and extra sheets of your own are
+ignored with a warning. The sheets are deliberately left unprotected, since Excel forbids moving
+rows on a protected sheet.
+
+Import is **all-or-nothing**. The workbook is validated as a whole first -- a renamed net, a
+duplicated or unknown `Key`, a missing column, unreadable numbers, a voltage of 0 or less, an
+unknown component or ground net -- and if anything fails, every problem is listed with its cell
+(`VRMs!F7`) and *nothing* is applied. On a clean file you get a preview of how many cells across how
+many rows would change; applying pushes them as one undo step (Ctrl+Z undoes the whole import).
+Cells that already match are skipped, and rows missing from the workbook are left as they are.
+
 ## Building locally
 
 ```powershell
@@ -190,6 +227,10 @@ Full grammar lives in the internal `spd_dc_format_spec.md` design notes; short s
   넷 이름에서 전압을 자동으로 추정합니다 (예: `ADC_VDD_070_...` → 0.7V).
 - 이 정보를 바탕으로 `.VRM` / `.Sink` 블록을 생성하고, 표에서 여러 행·셀을 한 번에 선택해 값을
   채우거나 붙여넣는 일괄 편집(bulk edit)을 지원합니다.
+- **VRM/Sink 표를 엑셀(.xlsx)로 내보내고 다시 불러올 수 있습니다.** 엑셀에서 값을 고치고 행 순서를
+  마음대로 바꿔도 `Key` 열로 행을 찾으므로 순서는 상관없습니다. 다만 `Key`·`Net` 셀(채널 이름)과
+  열 구성은 바뀌면 안 되며, 문제가 하나라도 있으면 셀 위치와 함께 모두 보여주고 **아무것도 적용하지
+  않습니다**. 정상 파일은 한 번의 Ctrl+Z로 전체를 되돌릴 수 있는 하나의 작업으로 반영됩니다.
 - 원본 파일은 스트리밍 방식으로 읽고 써서 메모리 사용량을 낮게 유지하며, 출력은 항상 LF 개행만
   사용하고 원본 파일은 절대 덮어쓰지 않습니다.
 - 설치는 Releases 페이지의 설치 프로그램을 사용하거나, 개발 시 `pip install -e ".[dev]"`로 소스에서
