@@ -23,6 +23,13 @@ class NetEntry:
     attrs: tuple[tuple[str, str], ...]  # ordered ("Color", "RED"), ("Voltage", "0")...
     raw: str  # verbatim line, no trailing "\n"
     index: int  # position in body (entry ordinal, not byte offset)
+    # PowerSI production files may put the selection/view suffix on the
+    # destination token (``-> PowerNets::Unselected||DropShape``), rather than
+    # on the source net token.  Keep that location distinct from
+    # ``sel_state``/``view_mode`` so an unchanged body can still be rendered
+    # canonically after a neighbouring entry is edited.
+    group_sel_state: str | None = None
+    group_view_mode: str | None = None
 
 
 @dataclass(frozen=True)
@@ -52,6 +59,22 @@ class PinMapIndex:
         ]
         candidates.sort(key=lambda item: (-item[1], item[0]))
         return [circuit for circuit, _count in candidates]
+
+
+@dataclass(frozen=True)
+class SourceIdentity:
+    """Identity snapshot captured while scanning an SPD source.
+
+    ``st_dev``/``st_ino`` are best-effort file identifiers (Windows exposes
+    them on modern Python builds); size and nanosecond mtime remain the primary
+    change detector and are portable across filesystems.
+    """
+
+    resolved_path: str
+    size: int
+    mtime_ns: int
+    st_dev: int | None = None
+    st_ino: int | None = None
 
 
 @dataclass
@@ -132,6 +155,7 @@ class ScanResult:
     existing_vrms: tuple[ExistingBlock, ...]
     existing_sinks: tuple[ExistingBlock, ...]
     warnings: tuple[str, ...]
+    source_identity: SourceIdentity | None = None
 
 
 @dataclass(frozen=True)

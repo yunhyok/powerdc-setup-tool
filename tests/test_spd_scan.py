@@ -467,16 +467,11 @@ def test_missing_sections_raise(tmp_path):
         assert label  # keeps the case label in the failure output
 
 
-def test_unterminated_connect_block_warns_and_recovers(tmp_path):
+def test_unterminated_connect_block_fails_closed(tmp_path):
     path = _build(tmp_path)
     _rewrite(path, [(b"8 $Package.Node1008!!8::DGND\n.EndC\n", b"8 $Package.Node1008!!8::DGND\n")])
-    scan = scan_spd(path)
-    assert any(".EndC" in w for w in scan.warnings)
-    assert scan.pin_maps.pins("LGA", fixtures.GROUND_NET) == (
-        ("7", "Node1007"),
-        ("8", "Node1008"),
-    )
-    assert scan.netlist_body  # the rest of the file still scanned
+    with pytest.raises(SpdFormatError, match="not terminated"):
+        scan_spd(path)
 
 
 # --------------------------------------------------------------------------- #

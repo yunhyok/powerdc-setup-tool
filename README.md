@@ -7,6 +7,15 @@ Sigrity PowerSI `.spd` design for PowerDC (DCR) analysis: classify nets, pair po
 return (ground) nets, set per-net voltages, and generate the `.VRM` / `.Sink` blocks PowerDC
 expects -- then stream out a new `.spd` file, leaving the original untouched.
 
+## v0.1.6
+
+This release hardens production-sized SPD parsing and export while keeping the
+streaming, source-never-overwritten workflow.
+
+- **Fail-safe production grammar handling** -- PowerSI group metadata, bare/slash/underscore capacitor
+  RefDes names, Connect pin mismatches, malformed DC block ordering, and stale/aliased source paths are
+  rejected or preserved losslessly before an output staging file is created.
+
 ## v0.1.5
 
 Maintenance release: v0.1.4 built fine locally but its Windows job crashed the test run outright
@@ -189,18 +198,34 @@ This runs the test suite (`pytest -m "not slow"`), builds a onedir PyInstaller b
 `packaging/powerdc-setup-tool.iss` (resolving `ISCC.exe` from the usual Inno Setup 6 install
 location, PATH, or a Chocolatey install as a last resort). Useful switches:
 
-- `-Version <version>` -- version string baked into the installer filename and metadata.
+- `-Version <version>` -- must match the canonical version in both `pyproject.toml` and
+  `src/powerdc_setup_tool/__init__.py`; a mismatch fails before tests or packaging start.
 - `-SkipTests` -- skip the pytest run.
 - `-SkipInstaller` -- stop after the PyInstaller build, skipping Inno Setup.
 
 ## CI & releases
 
-[`.github/workflows/build.yml`](.github/workflows/build.yml) runs on every push of a `v*` tag (and
-can be run manually via `workflow_dispatch`). On `windows-latest` it installs the project, runs the
-test suite (`QT_QPA_PLATFORM=offscreen`), builds the PyInstaller bundle and Inno Setup installer,
-uploads the installer as a build artifact, and -- for tag pushes only -- publishes a GitHub Release
-with the installer attached via `gh release create`. `scripts/publish_release.ps1` does the
-equivalent from a local checkout (creates the GitHub repo if needed, pushes, and creates the release).
+[`.github/workflows/build.yml`](.github/workflows/build.yml) runs on every push of a `v*` tag, on
+pull requests, and manually via `workflow_dispatch`. On `windows-latest` it installs the project,
+runs the test suite (`QT_QPA_PLATFORM=offscreen`), verifies tag pushes against the canonical project
+version, and builds the PyInstaller bundle and Inno Setup installer. Pull-request/manual runs produce
+read-only build artifacts (`<version>-dev.<run>` for manual runs) and never publish a release. A tag
+push alone gets the `contents: write` permission needed by the idempotent release job, which verifies
+the tag and publishes only the installer produced by that tagged workflow run.
+
+For a local release, run from the clean named branch that contains the reviewed
+commit:
+
+```powershell
+.\scripts\publish_release.ps1 -Version 0.1.6
+```
+
+The script refuses dirty or detached checkouts, missing `origin`, version drift, and any existing
+local or remote `v0.1.6` tag. It records the current branch/HEAD, creates and pushes an annotated tag
+at that exact commit, and then lets the tag-triggered workflow build the installer from that commit.
+The workflow is the sole asset publisher: it uses `gh release create --verify-tag`, repairs a missing
+asset, and accepts an existing release only after the expected filename and SHA-256 digest match the
+current tagged build. A stale local installer can therefore never be attached to a release.
 
 ## Tests
 
@@ -225,9 +250,12 @@ Two of them need extra context:
 
 Full grammar lives in the internal `spd_dc_format_spec.md` design notes; short summary:
 
-- **`.NetList`** -- a serialized 2-level tree of nets. Power/Ground membership is expressed purely by
-  membership in the built-in `PowerNets` / `GroundNets` group nodes; a classified net drops its
-  `::Unselected||DropShape` suffix.
+- **`.NetList`** -- a serialized 2-level tree of nets. Power/Ground membership is expressed by
+  membership in the built-in `PowerNets` / `GroundNets` group nodes. The parser accepts both the
+  legacy plain destination (`-> PowerNets`) and production destination metadata
+  (`-> PowerNets::Unselected||DropShape`), including inherited members with source metadata such as
+  `::Unselected||DropShape`. For rows already classified by the input, a source `Unselected` marker
+  maps to an off `Use` state without changing the electrical group membership.
 - **`.PowerDC`** -- the large DC-analysis section. Holds `.OtherCircuit` discrete-component entries,
   an empty `.SpiceNetlist` placeholder, then every `.VRM` block followed by every `.Sink` block,
   contiguous with no blank lines between them.

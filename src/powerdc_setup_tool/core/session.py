@@ -114,7 +114,7 @@ from powerdc_setup_tool.core.model import (
     VrmConfig,
 )
 from powerdc_setup_tool.core.netlist import GROUP_NODES, render_netlist
-from powerdc_setup_tool.core.pdc_gen import OTHER_CIRCUIT_RE
+from powerdc_setup_tool.core.pdc_gen import is_other_circuit
 from powerdc_setup_tool.core.writer import WritePlan
 
 __all__ = [
@@ -470,7 +470,16 @@ class Session:
                 net=name,
                 net_class=net_class,
                 voltage=DEFAULT_VOLTAGE,
-                selected=True,
+                # In the production suffix grammar, source rows inside an
+                # explicitly classified group can carry ``::Unselected``.
+                # Treat that as the input Use state only for rows whose
+                # electrical class came from the input.  Unclassified rows
+                # often carry the same view metadata and must remain usable
+                # when name-based auto-classification promotes them later.
+                selected=not (
+                    net_class != CLASS_NONE
+                    and (entry.sel_state or "").lower() == "unselected"
+                ),
                 die=naming.die_of(name),
                 from_input=net_class != CLASS_NONE,
                 # v0.1.2 Source column: the `.NetList` group *is* the origin.
@@ -773,12 +782,32 @@ class Session:
         return [
             name
             for name in self._circuit_names()
-            if not _is_site(name) and not OTHER_CIRCUIT_RE.match(name)
+            if not _is_site(name) and not is_other_circuit(name)
         ]
 
     def _default_vrm_comp(self, net: str, gnet: str) -> str:
-        """§G.3: non-`SITE`, non-`.OtherCircuit` circuit with the most pins of *gnet*."""
+        """Choose a board circuit carrying both the rail and its return.
+
+        A GND-heavy package with no pins on the requested power net is not a
+        valid VRM component: selecting it would render an empty Positive Pin
+        section and fail validation.  Prefer the intersection, ranked by
+        ground pins, then positive pins, then ASCII name.  The historical
+        one-net ranking remains a fallback only when no board circuit carries
+        both nets.
+        """
         board = self._board_circuits()
+        common = [
+            name for name in board if self._pins(name, net) and self._pins(name, gnet)
+        ]
+        if common:
+            return min(
+                common,
+                key=lambda name: (
+                    -len(self._pins(name, gnet)),
+                    -len(self._pins(name, net)),
+                    name,
+                ),
+            )
         return (
             self._best_circuit(board, gnet)
             or self._best_circuit(self._circuit_names(), gnet)
@@ -1591,7 +1620,7 @@ class Session:
             other_circuits = None
         elif emit_other:
             other_circuits = tuple(
-                name for name in scan.other_circuit_names if OTHER_CIRCUIT_RE.match(name)
+                name for name in scan.other_circuit_names if is_other_circuit(name)
             )
         else:
             other_circuits = ()
