@@ -216,6 +216,13 @@ def test_release_assets_are_verified_and_local_script_is_not_an_asset_publisher(
     assert "Get-FileHash" in workflow
     assert "digest" in workflow
     assert "--verify-tag" in workflow
+    # Missing assets take the repair path; an existing wrong/malformed digest
+    # fails closed before that path, while a matching digest is the only success.
+    assert "if (-not (Assert-ExpectedAsset @($release.Assets)))" in workflow
+    assert "gh release upload $tag $assetPath --clobber" in workflow
+    assert "has no verifiable SHA-256 digest" in workflow
+    assert "digest does not match the tagged build" in workflow
+    assert "asset $assetName verified at SHA-256" in workflow
 
 
 def test_build_script_rejects_version_drift() -> None:
