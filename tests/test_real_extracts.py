@@ -35,6 +35,7 @@ import os
 import re
 from collections import Counter
 from pathlib import Path
+from typing import Callable
 
 import pytest
 
@@ -49,7 +50,6 @@ from powerdc_setup_tool.core.pdc_gen import (
     render_sink,
     render_vrm,
 )
-from powerdc_setup_tool.core.spd_scan import _split_block_name
 
 EXTRACTS = Path(
     os.environ.get("POWERDC_REAL_EXTRACTS", "/mnt/user-data/uploads/DCR/_extracts")
@@ -93,6 +93,37 @@ def _netlist_body(text: str) -> str:
     assert lines[0] == ".NetList", f"unexpected first line {lines[0]!r}"
     end = max(i for i, line in enumerate(lines) if line == ".EndNetList")
     return "\n".join(lines[1:end]) + "\n"
+
+
+def _split_generated_block_name(
+    name: str,
+    prefix: str,
+    build: Callable[[str, str, str], str],
+    circuits: tuple[str, ...],
+    known_nets: set[str],
+) -> tuple[str, str, str]:
+    """Decode a generated name for this test's known finite vocabulary.
+
+    The scanner intentionally no longer infers identities from names.  These
+    tests only need to validate that real headers round-trip through the
+    generator naming helpers, so resolve the finite fixture vocabulary here.
+    """
+    if not name.startswith(prefix):
+        raise AssertionError(f"unexpected block prefix in {name!r}")
+    rest = name[len(prefix) :]
+    for comp in sorted(circuits, key=len, reverse=True):
+        marker = comp + "_"
+        if not rest.startswith(marker):
+            continue
+        after_comp = rest[len(marker) :]
+        for pnet in sorted(known_nets, key=len, reverse=True):
+            marker = pnet + "_"
+            if not after_comp.startswith(marker):
+                continue
+            gnet = after_comp[len(marker) :]
+            if gnet in known_nets and build(comp, pnet, gnet) == name:
+                return comp, pnet, gnet
+    raise AssertionError(f"could not decode generated block name {name!r}")
 
 
 _MAP_RE = re.compile(r"^\.Map CircuitName = (\S+) CircuitPinName = (\S+)$")
@@ -353,7 +384,9 @@ def test_every_real_block_name_round_trips_through_naming() -> None:
         *((h, "SINK_", naming.sink_name) for h in sinks),
     ):
         name = _block_name(header)
-        comp, pnet, gnet = _split_block_name(name, prefix, circuits, known_nets)
+        comp, pnet, gnet = _split_generated_block_name(
+            name, prefix, build, tuple(circuits), known_nets
+        )
         assert build(comp, pnet, gnet) == name, f"{name!r} does not round-trip"
         assert pnet in power, f"{pnet!r} is not a PowerNets member"
         comps[comp] += 1
@@ -370,7 +403,9 @@ def test_every_real_sink_component_follows_the_die_rule() -> None:
     known_nets = _real_net_names()
     circuits = dict.fromkeys(REAL_CIRCUITS, 0)
     for header in _headers(".Sink "):
-        comp, pnet, _gnet = _split_block_name(_block_name(header), "SINK_", circuits, known_nets)
+        comp, pnet, _gnet = _split_generated_block_name(
+            _block_name(header), "SINK_", naming.sink_name, tuple(circuits), known_nets
+        )
         assert comp == naming.sink_component(naming.die_of(pnet))
 
 

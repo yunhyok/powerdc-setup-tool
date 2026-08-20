@@ -99,6 +99,7 @@ from PySide6.QtWidgets import (
 from shiboken6 import Shiboken
 
 from powerdc_setup_tool.core import xlsx_io
+from powerdc_setup_tool import __version__
 from powerdc_setup_tool.core.model import ScanResult, ValidationIssue
 from powerdc_setup_tool.core.session import Session, split_key
 from powerdc_setup_tool.core.writer import WritePlan
@@ -110,7 +111,7 @@ from powerdc_setup_tool.ui.workers import ExportWorker, ScanWorker
 
 __all__ = ["MainWindow", "APP_TITLE"]
 
-APP_TITLE = "SPD Manipulator for PowerDC"
+APP_TITLE = f"SPD Manipulator for PowerDC v{__version__}"
 
 #: How long `closeEvent` blocks on each worker thread before giving up on a
 #: synchronous close and retrying from the thread's `finished` signal instead.

@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.1.5",
+    [string]$Version = "0.1.6",
     [switch]$SkipInstaller,
     [switch]$SkipTests
 )
@@ -7,6 +7,29 @@ param(
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
+
+function Get-CanonicalVersion {
+    $pyproject = Get-Content -Raw (Join-Path $Root "pyproject.toml")
+    $projectMatch = [regex]::Match($pyproject, '(?m)^\s*version\s*=\s*"([^"]+)"\s*$')
+    if (-not $projectMatch.Success) {
+        throw "Canonical project version was not found in pyproject.toml."
+    }
+
+    $package = Get-Content -Raw (Join-Path $Root "src\powerdc_setup_tool\__init__.py")
+    $packageMatch = [regex]::Match($package, '__version__\s*=\s*"([^"]+)"')
+    if (-not $packageMatch.Success) {
+        throw "Package __version__ was not found in src/powerdc_setup_tool/__init__.py."
+    }
+    if ($projectMatch.Groups[1].Value -ne $packageMatch.Groups[1].Value) {
+        throw "pyproject.toml version $($projectMatch.Groups[1].Value) does not match package version $($packageMatch.Groups[1].Value)."
+    }
+    return $projectMatch.Groups[1].Value
+}
+
+$canonicalVersion = Get-CanonicalVersion
+if ($Version -ne $canonicalVersion) {
+    throw "Requested build version '$Version' does not match canonical project version '$canonicalVersion'."
+}
 
 function Resolve-Iscc {
     # windows-latest ships Inno Setup 6 preinstalled at this fixed path; `iscc`
@@ -39,9 +62,17 @@ function Resolve-Iscc {
 if ($SkipTests) {
     Write-Host "Skipping tests (-SkipTests)."
 } else {
-    python -m pytest -m "not slow"
-    if ($LASTEXITCODE -ne 0) {
-        throw "pytest failed with exit code $LASTEXITCODE."
+    # Keep local/CI Qt behavior identical.  Without an offscreen platform a
+    # desktop session can deadlock while a delegate creates a QCompleter.
+    $previousQtPlatform = $env:QT_QPA_PLATFORM
+    $env:QT_QPA_PLATFORM = "offscreen"
+    try {
+        python -m pytest -m "not slow"
+        if ($LASTEXITCODE -ne 0) {
+            throw "pytest failed with exit code $LASTEXITCODE."
+        }
+    } finally {
+        $env:QT_QPA_PLATFORM = $previousQtPlatform
     }
 }
 

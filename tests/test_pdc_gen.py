@@ -158,24 +158,44 @@ def test_empty_pin_sections_still_emit_their_pin_pair() -> None:
 
 def test_render_other_circuits_template_and_sort_order() -> None:
     # design §D step 3: sorted by (numeric id, die).
-    assert render_other_circuits(["C10132_1", "C1_1", "C2_0", "C1_0", "C10132_0"]) == (
+    assert render_other_circuits(
+        ["C10132_1", "C1_1", "C2_0", "C1_0", "C10132_0", "C1", "C2/1"]
+    ) == (
+        '.OtherCircuit Device = C1 Name = "C1"\n'
         '.OtherCircuit Device = C1_0 Name = "C1_0"\n'
         '.OtherCircuit Device = C1_1 Name = "C1_1"\n'
         '.OtherCircuit Device = C2_0 Name = "C2_0"\n'
+        '.OtherCircuit Device = C2/1 Name = "C2/1"\n'
         '.OtherCircuit Device = C10132_0 Name = "C10132_0"\n'
         '.OtherCircuit Device = C10132_1 Name = "C10132_1"\n'
     )
     assert render_other_circuits([]) == ""
 
 
-@pytest.mark.parametrize("name", ["C1_0", "C1_1", "C10132_1", "C4_0", "C99999_0"])
+@pytest.mark.parametrize(
+    "name", ["C1", "C1/0", "C1/1", "C1_0", "C1_1", "C10132_1", "C4_0", "C99999_0"]
+)
 def test_other_circuit_re_accepts(name: str) -> None:
     assert OTHER_CIRCUIT_RE.match(name)
 
 
 @pytest.mark.parametrize(
     "name",
-    ["LGA", "SITE0", "SITE1", "C1", "C1_2", "ALI1", "DUT", "C_0", "CC1_0", "C1_0X", "xC1_0"],
+    [
+        "LGA",
+        "SITE0",
+        "SITE1",
+        "C1_2",
+        "C1/2",
+        "C1A",
+        "C1_0_extra",
+        "ALI1",
+        "DUT",
+        "C_0",
+        "CC1_0",
+        "C1_0X",
+        "xC1_0",
+    ],
 )
 def test_other_circuit_re_rejects(name: str) -> None:
     assert not OTHER_CIRCUIT_RE.match(name)

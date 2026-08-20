@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
-from powerdc_setup_tool.core.model import ScanResult, SinkConfig, VrmConfig
+from powerdc_setup_tool.core.model import ScanResult, SinkConfig, SourceIdentity, VrmConfig
 from powerdc_setup_tool.core.pdc_gen import (
     NegPinCache,
     estimate_block_bytes,
@@ -97,20 +97,40 @@ def write_spd(
     """
     source = Path(scan.path)
     output = Path(output)
-    _ensure_output_is_not_source(source, output)
+    part = output.with_name(output.name + ".part")
+    _ensure_output_is_not_source(source, output, part)
+    expected_identity = scan.source_identity
+    _verify_source_stable(source, scan, expected_identity)
     _check_free_space(output, scan.file_size)
 
-    part = output.with_name(output.name + ".part")
     reporter = _Progress(progress, scan.file_size + _plan_size_delta(scan, plan))
+    staging_created = False
     try:
         with (
             source.open("rb", buffering=_CHUNK_SIZE) as src,
-            part.open("wb", buffering=_CHUNK_SIZE) as dst,
+            # ``x`` is important here: the alias check above is only a
+            # snapshot.  A caller, filesystem watcher, or another process can
+            # create a hardlink/symlink at ``part`` after that check and before
+            # this open.  Truncating with ``wb`` would then destroy the source
+            # through the alias.  Exclusive creation gives us a new inode and
+            # leaves any pre-existing staging path untouched on failure.
+            part.open("xb", buffering=_CHUNK_SIZE) as dst,
         ):
+            staging_created = True
             _splice(scan, plan, src, dst, reporter, cancel)
+        # Do not publish a mixed snapshot if the source was edited while the
+        # potentially long export was in flight.  The staging file is removed
+        # by the exception path and the source remains untouched.
+        _verify_source_stable(source, scan, expected_identity)
         os.replace(part, output)
+        staging_created = False
     except BaseException:
-        part.unlink(missing_ok=True)
+        # Never remove a stale/external ``.part`` that this call did not create.
+        # In particular, ``part.open('xb')`` can fail after a race-created
+        # hardlink is in place; unlinking unconditionally would erase that
+        # caller-owned path (and, before this guard, could erase the source).
+        if staging_created:
+            part.unlink(missing_ok=True)
         raise
     reporter.finish()
 
@@ -371,15 +391,64 @@ def _encode(text: str) -> bytes:
     return text.encode("utf-8", errors="surrogateescape")
 
 
-def _ensure_output_is_not_source(source: Path, output: Path) -> None:
-    """Raise `ValueError` if *output* resolves to the same file as *source*."""
-    if source.exists() and output.exists() and os.path.samefile(source, output):
-        raise ValueError(
-            "Output path must differ from the source SPD path; writing would destroy the source."
+def _path_alias(first: Path, second: Path) -> bool:
+    """Best-effort alias test covering existing hardlinks and symlinks."""
+    try:
+        if first.exists() and second.exists() and os.path.samefile(first, second):
+            return True
+    except OSError:
+        pass
+    try:
+        return first.resolve(strict=False) == second.resolve(strict=False)
+    except OSError:
+        return os.path.normcase(os.path.abspath(str(first))) == os.path.normcase(
+            os.path.abspath(str(second))
         )
-    if source.resolve() == output.resolve():
+
+
+def _ensure_output_is_not_source(
+    source: Path, output: Path, part: Path | None = None
+) -> None:
+    """Reject output *and staging* paths that alias the source before any write."""
+    candidates = (output, part) if part is not None else (output,)
+    if any(_path_alias(source, candidate) for candidate in candidates):
         raise ValueError(
-            "Output path must differ from the source SPD path; writing would destroy the source."
+            "Output path (including its staging file) must differ from the source "
+            "SPD path; writing would destroy the source."
+        )
+
+
+def _capture_source_identity(path: Path) -> SourceIdentity:
+    stat = path.stat()
+    return SourceIdentity(
+        resolved_path=str(path.resolve(strict=False)),
+        size=stat.st_size,
+        mtime_ns=stat.st_mtime_ns,
+        st_dev=getattr(stat, "st_dev", None),
+        st_ino=getattr(stat, "st_ino", None),
+    )
+
+
+def _verify_source_stable(
+    source: Path, scan: ScanResult, expected: SourceIdentity | None
+) -> None:
+    """Raise before staging/publish when the scanned source is no longer stable."""
+    try:
+        actual = _capture_source_identity(source)
+    except OSError as exc:
+        raise ValueError(f"Source SPD disappeared or is unreadable: {source}") from exc
+    if expected is not None:
+        if actual != expected:
+            raise ValueError(
+                "Source SPD changed after scanning; scan it again before exporting."
+            )
+        return
+    # Hand-built ScanResult fixtures from older callers predate the identity
+    # field.  At minimum, refuse an offset-bearing plan when the file length no
+    # longer matches that scan snapshot.
+    if actual.size != scan.file_size:
+        raise ValueError(
+            "Source SPD size changed after scanning; scan it again before exporting."
         )
 
 

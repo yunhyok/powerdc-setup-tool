@@ -48,6 +48,7 @@ from powerdc_setup_tool.core.model import NetEntry, PowerNetConfig
 __all__ = [
     "NETLIST_COLORS",
     "GROUP_NODES",
+    "NetlistFormatError",
     "parse_netlist",
     "render_netlist",
 ]
@@ -78,6 +79,10 @@ _VIEW_DROPSHAPE = "DropShape"
 
 _ENTRY_PREFIX = "\t"
 _GROUP_SEP = " -> "
+
+
+class NetlistFormatError(ValueError):
+    """Raised when a `.NetList` contains structure the writer cannot preserve."""
 
 
 # --------------------------------------------------------------------------- #
@@ -113,32 +118,46 @@ def _parse_attrs(text: str) -> tuple[tuple[str, str], ...]:
     return tuple(attrs)
 
 
-def _split_head(text: str) -> tuple[str, str | None, bool, str | None, str | None, str]:
-    """Split one entry line body into (name, group, explicit, sel, view, attrs_text)."""
+def _split_metadata(token: str) -> tuple[str, str | None, str | None]:
+    """Split ``NAME::selection||view`` into its three grammar fields."""
+    if "::" not in token:
+        return token, None, None
+    name, _, tail = token.partition("::")
+    if "||" in tail:
+        sel, _, view = tail.partition("||")
+    else:
+        sel, view = tail, None
+    return name, sel or None, view or None
+
+
+def _split_head(
+    text: str,
+) -> tuple[
+    str,
+    str | None,
+    bool,
+    str | None,
+    str | None,
+    str | None,
+    str | None,
+    str,
+]:
+    """Split one entry line body into source/destination grammar fields."""
     group: str | None = None
     explicit = False
+    group_sel: str | None = None
+    group_view: str | None = None
     if _GROUP_SEP in text:
         head, _, after = text.partition(_GROUP_SEP)
         group_token, _, rest = after.partition(" ")
-        group = group_token
+        group, group_sel, group_view = _split_metadata(group_token)
         explicit = True
         attrs_text = rest
     else:
         head, _, attrs_text = text.partition(" ")
 
-    sel: str | None = None
-    view: str | None = None
-    if "::" in head:
-        name, _, tail = head.partition("::")
-        if "||" in tail:
-            sel, _, view = tail.partition("||")
-        else:
-            sel = tail
-        sel = sel or None
-        view = view or None
-    else:
-        name = head
-    return name, group, explicit, sel, view, attrs_text
+    name, sel, view = _split_metadata(head)
+    return name, group, explicit, sel, view, group_sel, group_view, attrs_text
 
 
 def parse_netlist(body: str) -> list[NetEntry]:
@@ -155,7 +174,14 @@ def parse_netlist(body: str) -> list[NetEntry]:
         lines.pop()
 
     entries: list[NetEntry] = []
+    seen_names: set[str] = set()
     current_group: str | None = None
+    # Production PowerSI emits the selection/view suffix on the destination
+    # marker itself.  In that form inherited source rows may repeat
+    # ``::Unselected||DropShape`` and still belong to the active group.  Keep
+    # the legacy behaviour (source metadata terminates a plain marker run) for
+    # the older ``-> PowerNets`` grammar used by existing fixtures.
+    destination_metadata_active = False
     for index, raw in enumerate(lines):
         text = raw[:-1] if raw.endswith("\r") else raw
         if not text.startswith(_ENTRY_PREFIX):
@@ -172,18 +198,44 @@ def parse_netlist(body: str) -> list[NetEntry]:
                     index=index,
                 )
             )
+            # An opaque separator terminates positional inheritance.  This is
+            # especially important after a production destination-metadata
+            # run: a declassified source row appended after a blank must not be
+            # pulled back into the preceding group on a later parse.
+            current_group = None
+            destination_metadata_active = False
             continue
 
-        name, group, explicit, sel, view, attrs_text = _split_head(text[len(_ENTRY_PREFIX) :])
+        (
+            name,
+            group,
+            explicit,
+            sel,
+            view,
+            group_sel,
+            group_view,
+            attrs_text,
+        ) = _split_head(text[len(_ENTRY_PREFIX) :])
         if explicit:
+            if group not in GROUP_NODES:
+                raise NetlistFormatError(
+                    f"unknown .NetList destination group {group!r}; only "
+                    "PowerNets and GroundNets are supported"
+                )
             current_group = group
-        elif sel is not None or view is not None:
+            destination_metadata_active = group_sel is not None or group_view is not None
+        elif (sel is not None or view is not None) and not destination_metadata_active:
             # spec §2: a classified net drops "::sel||view" -> this line is L1
             # and terminates the enclosing member run.
             group = None
             current_group = None
         else:
             group = current_group
+
+        if name:
+            if name in seen_names:
+                raise NetlistFormatError(f"duplicate .NetList entry name {name!r}")
+            seen_names.add(name)
 
         entries.append(
             NetEntry(
@@ -195,6 +247,8 @@ def parse_netlist(body: str) -> list[NetEntry]:
                 attrs=_parse_attrs(attrs_text),
                 raw=raw,
                 index=index,
+                group_sel_state=group_sel,
+                group_view_mode=group_view,
             )
         )
     return entries
@@ -214,10 +268,16 @@ def _render_entry(e: NetEntry) -> str:
     if not e.raw.startswith(_ENTRY_PREFIX) and not e.name:
         return e.raw  # opaque passthrough line
     out = [_ENTRY_PREFIX, e.name]
-    if e.group_explicit and e.group:
-        out.append(f"{_GROUP_SEP}{e.group}")
+    # Source selection/view metadata belongs immediately after the source net
+    # token, before an explicit destination marker.  Production files may also
+    # carry a second suffix on the destination group token; keep those two
+    # locations independent when a line is rewritten.
     if e.sel_state is not None or e.view_mode is not None:
         out.append(f"::{e.sel_state or ''}||{e.view_mode or ''}")
+    if e.group_explicit and e.group:
+        out.append(f"{_GROUP_SEP}{e.group}")
+        if e.group_sel_state is not None or e.group_view_mode is not None:
+            out.append(f"::{e.group_sel_state or ''}||{e.group_view_mode or ''}")
     for key, value in e.attrs:
         out.append(f" {key} = {value}")
     return "".join(out)
@@ -279,8 +339,14 @@ def _rewrite(
         # spec §9 "net entry, unclassified" template.
         sel: str | None = _SEL_UNSELECTED
         view: str | None = _VIEW_DROPSHAPE
+    elif cfg is not None and not cfg.selected:
+        # PowerSI's source suffix is the persisted Net Manager Use state.  A
+        # classified row may therefore retain it; destination metadata on the
+        # first group marker keeps inherited rows in the group.
+        sel = _SEL_UNSELECTED
+        view = _VIEW_DROPSHAPE
     else:
-        sel = view = None  # §A7: classified nets drop "::sel||view"
+        sel = view = None
 
     return replace(
         e,
@@ -288,8 +354,27 @@ def _rewrite(
         group_explicit=bool(group) and first_child,
         sel_state=sel,
         view_mode=view,
+        group_sel_state=(e.group_sel_state if group is None else None),
+        group_view_mode=(e.group_view_mode if group is None else None),
         attrs=attrs,
     )
+
+
+def _selection_suffix_matches(e: NetEntry, selected: bool) -> bool:
+    """Whether a classified entry already carries the requested Use state."""
+    source_unselected = (e.sel_state or "").casefold() == _SEL_UNSELECTED.casefold()
+    return source_unselected == (not selected)
+
+
+def _rewrite_selection(e: NetEntry, selected: bool) -> NetEntry:
+    """Rewrite only the source selection suffix, preserving position/group/raw attrs."""
+    if selected:
+        sel: str | None = None
+        view: str | None = None
+    else:
+        sel = _SEL_UNSELECTED
+        view = _VIEW_DROPSHAPE
+    return replace(e, sel_state=sel, view_mode=view)
 
 
 def _new_entry(name: str) -> NetEntry:
@@ -353,7 +438,8 @@ def render_netlist(
     """
     # ---------------------------------------------------------------- pass 1:
     # decide, per entry, whether it stays put.
-    moved: dict[int, str | None] = {}  # index -> desired group
+    moved: dict[int, str | None] = {}  # index -> desired group (classification move)
+    selection_edits: dict[int, bool] = {}  # index -> desired selected state, in place
     for i, e in enumerate(entries):
         if not _editable(e):
             continue
@@ -363,6 +449,14 @@ def render_netlist(
         desired = _desired_group(cfg)
         if desired != e.group:
             moved[i] = desired
+        elif (
+            desired is not None
+            and cfg.from_input
+            and not _selection_suffix_matches(e, cfg.selected)
+        ):
+            # A Use-only change must not be treated as a group move: preserve
+            # the source position and rewrite just its selection suffix.
+            selection_edits[i] = cfg.selected
 
     # ---------------------------------------------------------------- pass 2:
     # per group, the surviving member run and what gets appended to it.
@@ -400,10 +494,48 @@ def render_netlist(
     rendered: list[str | None] = [None] * len(entries)
     for i, e in enumerate(entries):
         if i not in moved:
-            rendered[i] = e.raw
+            if i in selection_edits:
+                rendered[i] = _render_entry(_rewrite_selection(e, selection_edits[i]))
+            else:
+                rendered[i] = e.raw
 
     # Promote/demote the "-> Group" marker: it belongs on the first member only.
     appended_at: dict[int, list[str]] = {}
+    # If the old first child moves away, its destination suffix is the only
+    # evidence that subsequent ``::Unselected`` source rows belong to this
+    # group.  Carry that style to the promoted survivor instead of silently
+    # converting the run back to the legacy grammar.
+    group_metadata: dict[str, tuple[str | None, str | None]] = {}
+    for entry in entries:
+        # Include a marker that is itself being moved/declassified: it is the
+        # only place the destination suffix can be recovered for the promoted
+        # survivor.
+        if entry.group in survivors and entry.group_explicit:
+            group_metadata.setdefault(
+                entry.group,
+                (entry.group_sel_state, entry.group_view_mode),
+            )
+    # A legacy plain destination cannot safely carry source metadata on a
+    # member: the parser would interpret that suffix as leaving the group.
+    # Upgrade its first explicit marker when a selected=False row is edited or
+    # moved into that group.  Production metadata destinations already have
+    # this property, so they remain byte-identical on a no-op build plan.
+    destination_metadata_needed: set[str] = set()
+    for index, selected in selection_edits.items():
+        if not selected and entries[index].group in survivors:
+            group = entries[index].group
+            if group is not None:
+                destination_metadata_needed.add(group)
+    for group, arrivals in incoming.items():
+        if any(
+            configs.get(entry.name) is not None and not configs[entry.name].selected
+            for entry in arrivals
+        ):
+            destination_metadata_needed.add(group)
+    for group in destination_metadata_needed:
+        current = group_metadata.get(group)
+        if current is None or current == (None, None):
+            group_metadata[group] = (_SEL_UNSELECTED, _VIEW_DROPSHAPE)
     for group in (_GROUND, _POWER):
         run = survivors[group]
         arrivals = sorted(incoming[group], key=lambda e: e.name)
@@ -416,25 +548,69 @@ def render_netlist(
             entry = entries[index]
             want_explicit = position == 0
             if entry.group_explicit != want_explicit:
-                rendered[index] = _render_entry(
-                    replace(entry, group=group, group_explicit=want_explicit)
+                group_sel, group_view = (
+                    group_metadata.get(group, (None, None))
+                    if want_explicit
+                    else (None, None)
                 )
+                promoted = replace(
+                    entry,
+                    group=group,
+                    group_explicit=want_explicit,
+                    group_sel_state=group_sel,
+                    group_view_mode=group_view,
+                )
+                if index in selection_edits:
+                    promoted = _rewrite_selection(promoted, selection_edits[index])
+                rendered[index] = _render_entry(promoted)
+            elif group in destination_metadata_needed and want_explicit:
+                # Marker already occupies the first position, but its legacy
+                # destination token lacks selection/view metadata.  Re-render
+                # that one line so subsequent source metadata remains grouped.
+                marker = replace(
+                    entry,
+                    group=group,
+                    group_explicit=True,
+                    group_sel_state=_SEL_UNSELECTED,
+                    group_view_mode=_VIEW_DROPSHAPE,
+                )
+                if index in selection_edits:
+                    marker = _rewrite_selection(marker, selection_edits[index])
+                rendered[index] = _render_entry(marker)
 
         lines: list[str] = []
         for position, entry in enumerate(arrivals):
             color = NETLIST_COLORS[(color_seed + position) % len(NETLIST_COLORS)]
-            lines.append(
-                _render_entry(
-                    _rewrite(
-                        entry,
-                        group,
-                        first_child=not run and position == 0,
-                        cfg=configs.get(entry.name),
-                        color=color,
-                        emit_power_voltage=emit_power_voltage,
+            rewritten = _rewrite(
+                entry,
+                group,
+                first_child=not run and position == 0,
+                cfg=configs.get(entry.name),
+                color=color,
+                emit_power_voltage=emit_power_voltage,
+            )
+            prior_group_metadata = group_metadata.get(group)
+            if (
+                not run
+                and position == 0
+                and (
+                    group in destination_metadata_needed
+                    or (
+                        prior_group_metadata is not None
+                        and any(value is not None for value in prior_group_metadata)
                     )
                 )
-            )
+            ):
+                group_sel, group_view = prior_group_metadata or (
+                    _SEL_UNSELECTED,
+                    _VIEW_DROPSHAPE,
+                )
+                rewritten = replace(
+                    rewritten,
+                    group_sel_state=group_sel,
+                    group_view_mode=group_view,
+                )
+            lines.append(_render_entry(rewritten))
         if lines:
             anchor = _append_anchor(entries, survivors, group)
             appended_at.setdefault(anchor, []).extend(lines)
@@ -465,6 +641,15 @@ def render_netlist(
         out.append(line)
     for line in appended_at.get(len(entries), ()):
         out.append(line)
+    destination_groups = {
+        e.group
+        for e in entries
+        if e.group in survivors
+        and (e.group_sel_state is not None or e.group_view_mode is not None)
+    }
+    destination_groups.update(destination_metadata_needed)
+    if declassified and destination_groups:
+        out.append("")
     for entry in declassified:
         out.append(_render_entry(entry))
 

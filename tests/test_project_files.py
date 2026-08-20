@@ -86,7 +86,7 @@ def test_iss_defines_app_metadata_and_fresh_appid() -> None:
     assert NEW_APP_APPID in iss
     # Must not reuse the old app's installer identity.
     assert OLD_APP_APPID not in iss
-    assert "MyAppVersion" in iss and '"0.1.5"' in iss
+    assert "MyAppVersion" in iss and '"0.1.6"' in iss
     assert "SPD Manipulator for PowerDC" in iss  # DefaultDirName / Files source
     assert "desktopicon" in iss
     assert "Compression=lzma" in iss
@@ -130,12 +130,24 @@ def test_build_script_contents() -> None:
 def test_publish_release_script_contents() -> None:
     publish_ps1 = _read("scripts/publish_release.ps1")
 
-    assert '$Repo = "powerdc-setup-tool"' in publish_ps1
-    assert "gh" in publish_ps1
-    assert "--public" in publish_ps1
-    assert "gh repo create" in publish_ps1
-    assert "PowerDC-Setup-Tool-Setup" in publish_ps1
-    assert "gh release create" in publish_ps1
+    assert "PowerDC-Setup-Tool-Setup" not in publish_ps1
+    assert "gh repo create" not in publish_ps1
+    assert "--public" not in publish_ps1
+    assert "$Repo" not in publish_ps1
+    assert "gh release create" not in publish_ps1
+    assert "gh release upload" not in publish_ps1
+    assert "Get-CanonicalVersion" in publish_ps1
+    assert "does not match canonical project version" in publish_ps1
+    assert "git status --porcelain" in publish_ps1
+    assert "detached HEAD is not allowed" in publish_ps1
+    assert "No 'origin' remote found" in publish_ps1
+    assert "already exists locally" in publish_ps1
+    assert "already exists on origin" in publish_ps1
+    assert "git rev-parse --verify HEAD" in publish_ps1
+    assert "git tag --annotate" in publish_ps1
+    assert "refs/tags/$tag" in publish_ps1
+    assert "git ls-remote --tags origin" in publish_ps1
+    assert "Could not query remote tags on origin" in publish_ps1
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +160,9 @@ def test_workflow_contents() -> None:
 
     assert "windows-latest" in workflow
     assert "contents: write" in workflow
+    assert "contents: read" in workflow
     assert "v*" in workflow
+    assert "pull_request:" in workflow
     assert "workflow_dispatch" in workflow
     assert "actions/checkout@v4" in workflow
     assert "actions/setup-python@v5" in workflow
@@ -163,8 +177,59 @@ def test_workflow_contents() -> None:
     assert "actions/upload-artifact@v4" in workflow
     assert "PowerDC-Setup-Tool-Setup" in workflow
     assert "gh release create" in workflow
+    assert "--verify-tag" in workflow
+    assert "gh release view" in workflow
+    assert "gh release upload" in workflow
+    assert "--clobber" in workflow
+    assert "Get-FileHash" in workflow
+    assert "SHA-256 digest" in workflow
+    assert ".digest" in workflow
     assert "GH_TOKEN" in workflow and "secrets.GITHUB_TOKEN" in workflow
-    assert "0.0.0-dev" in workflow
+    assert "canonical-dev." in workflow
+    assert "does not match canonical project version" in workflow
+    assert "EVENT_NAME: ${{ github.event_name }}" in workflow
+    assert "REF_NAME: ${{ github.ref_name }}" in workflow
+    assert "RUN_NUMBER: ${{ github.run_number }}" in workflow
+    assert "BUILD_VERSION: ${{ steps.version.outputs.version }}" in workflow
+    assert "RELEASE_TAG: ${{ github.ref_name }}" in workflow
+    assert "RELEASE_VERSION: ${{ needs.build.outputs.version }}" in workflow
+    assert '$tag = "${{ github.ref_name }}"' not in workflow
+    assert '"${{ github.ref_name }}" -replace' not in workflow
+    assert '"/DMyAppVersion=${{ steps.version.outputs.version }}"' not in workflow
+    assert "if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')" in workflow
+
+
+def test_release_write_permission_is_scoped_to_tag_job() -> None:
+    workflow = _read(".github/workflows/build.yml")
+    assert "permissions:\n  contents: read" in workflow
+    build_section, release_section = workflow.split("\n  release:\n", 1)
+    assert "permissions:\n      contents: read" in build_section
+    assert "permissions:\n      contents: write" in release_section
+    assert "needs: build" in release_section
+
+
+def test_release_assets_are_verified_and_local_script_is_not_an_asset_publisher() -> None:
+    publish = _read("scripts/publish_release.ps1")
+    workflow = _read(".github/workflows/build.yml")
+    assert "gh release create" not in publish
+    assert "gh release upload" not in publish
+    assert "Get-FileHash" in workflow
+    assert "digest" in workflow
+    assert "--verify-tag" in workflow
+    # Missing assets take the repair path; an existing wrong/malformed digest
+    # fails closed before that path, while a matching digest is the only success.
+    assert "if (-not (Assert-ExpectedAsset @($release.Assets)))" in workflow
+    assert "gh release upload $tag $assetPath --clobber" in workflow
+    assert "has no verifiable SHA-256 digest" in workflow
+    assert "digest does not match the tagged build" in workflow
+    assert "asset $assetName verified at SHA-256" in workflow
+
+
+def test_build_script_rejects_version_drift() -> None:
+    build_ps1 = _read("scripts/build.ps1")
+    assert "Get-CanonicalVersion" in build_ps1
+    assert "Requested build version" in build_ps1
+    assert "does not match canonical project version" in build_ps1
 
 
 def test_ci_cannot_hang_for_six_hours_again() -> None:
@@ -229,6 +294,9 @@ def test_readme_documents_key_features() -> None:
     # Build workflow badge + release/build docs.
     assert "actions/workflows/build.yml" in readme
     assert "Releases" in readme
+    assert "clean named branch" in readme
+    assert "SHA-256 digest" in readme
+    assert "stale local installer" in readme
     # File-format one-liners.
     assert ".NetList" in readme
     assert ".PowerDC" in readme
@@ -261,7 +329,7 @@ def test_pyproject_matches_package_name_script_and_version() -> None:
     project = pyproject["project"]
 
     assert project["name"] == "powerdc-setup-tool"
-    assert project["version"] == "0.1.5"
+    assert project["version"] == "0.1.6"
 
     scripts = project.get("scripts", {})
     assert scripts.get("powerdc-setup-tool") == "powerdc_setup_tool.app:main"
@@ -302,7 +370,7 @@ def test_readme_carries_the_current_version_changelog() -> None:
     readme = _read("README.md")
 
     assert f"## v{version}" in readme
-    # v0.1.5's headline item (the Windows-crash maintenance release).
+    # v0.1.6's headline item (fail-safe SPD parsing/export maintenance).
     for phrase in ("Windows crash fix on rescan", "owned twice", "one owner"):
         assert phrase in readme, phrase
     # v0.1.4's headline items, plus the usage section they need, stay below it.

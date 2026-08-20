@@ -130,6 +130,7 @@ def test_window_title_and_size(make_window) -> None:
     window = make_window()
     assert APP_TITLE in window.windowTitle()
     assert "SPD Manipulator for PowerDC" in window.windowTitle()
+    assert "v0.1.6" in window.windowTitle()
     assert (window.size().width(), window.size().height()) == (1400, 860)
     assert (window.minimumSize().width(), window.minimumSize().height()) == (1100, 700)
 

@@ -23,7 +23,13 @@ Pins = tuple[tuple[str, str], ...]
 PinPairs = tuple[Pins, Pins]
 
 # spec §8 row 2 / design §G.2 default filter for `.OtherCircuit` emission.
-OTHER_CIRCUIT_RE: re.Pattern[str] = re.compile(r"^C\d+_[01]$")
+# Production RefDes spellings include bare ``C123``, slash-die ``C123/0`` /
+# ``C123/1`` and the legacy underscore-die ``C123_0`` / ``C123_1`` forms.
+# Keep this predicate strict: near misses (other die numbers, extra suffixes,
+# or alphanumeric tails) must never be regenerated as discrete circuits.
+OTHER_CIRCUIT_RE: re.Pattern[str] = re.compile(
+    r"^C(?P<number>\d+)(?:(?P<separator>[/_])(?P<die>[01]))?$"
+)
 
 # `NegPinCache` style keys. "sink" additionally carries ` Voltage = inf` (spec §5).
 STYLE_VRM = "vrm"
@@ -33,7 +39,12 @@ _STYLES = (STYLE_VRM, STYLE_SINK)
 # spec §5: every Sink `.Node` line carries this suffix (ambiguity A4: "always emit inf").
 _VOLTAGE_INF = " Voltage = inf"
 
-_OTHER_CIRCUIT_SORT_RE = re.compile(r"^C(\d+)_([01])$")
+_OTHER_CIRCUIT_SORT_RE = OTHER_CIRCUIT_RE
+
+
+def is_other_circuit(name: str) -> bool:
+    """Return whether *name* is an accepted discrete-capacitor RefDes."""
+    return OTHER_CIRCUIT_RE.fullmatch(str(name)) is not None
 
 
 def _num(value: float) -> str:
@@ -149,10 +160,13 @@ def render_sink(
 
 def _other_circuit_sort_key(name: str) -> tuple[int, int, int, str]:
     """Sort by (numeric id, die) per design §D step 3; unparsable names sort last."""
-    match = _OTHER_CIRCUIT_SORT_RE.match(name)
+    match = _OTHER_CIRCUIT_SORT_RE.fullmatch(name)
     if match is None:
         return (1, 0, 0, name)
-    return (0, int(match.group(1)), int(match.group(2)), name)
+    die = match.group("die")
+    # Bare RefDes has no die; sort it before the explicit die variants while
+    # retaining the exact source spelling as the deterministic final key.
+    return (0, int(match.group("number")), -1 if die is None else int(die), name)
 
 
 def render_other_circuits(names: Iterable[str]) -> str:
