@@ -7,6 +7,10 @@ Sigrity PowerSI `.spd` design for PowerDC (DCR) analysis: classify nets, pair po
 return (ground) nets, set per-net voltages, and generate the `.VRM` / `.Sink` blocks PowerDC
 expects -- then stream out a new `.spd` file, leaving the original untouched.
 
+## v0.1.6
+
+Windows Setup now displays the installation folder on both first installation and upgrade. Choose another drive or folder, or keep the suggested location.
+
 ## v0.1.5
 
 Maintenance release: v0.1.4 built fine locally but its Windows job crashed the test run outright
